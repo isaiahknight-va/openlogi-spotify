@@ -1,0 +1,7 @@
+id = "com.typ.openlogi.spotify"
+name = "Spotify Now Playing"
+description = "Shows the current Spotify track on a keypad key; press it to play or pause."
+version = "0.1.0"
+protocol = 1
+platforms = ["macos"]
+executable = "spotify-module"
