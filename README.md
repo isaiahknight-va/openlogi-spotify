@@ -133,7 +133,7 @@ controls take the album's colors) and an accent color picked from the cover.
 | `album` | The album name alone, on this one key. | Plays or pauses. |
 | `shuffle` | Shuffle arrows; in the accent color with an underline when on. | Turns shuffle on or off. |
 | `repeat` | The repeat loop, on or off like shuffle. | Turns repeat on or off. |
-| `liked` | A heart in the accent color, labeled Liked Songs. | Plays your Liked Songs, launching Spotify first if it is not running. Shuffle and repeat stay as they are. |
+| `liked` | A heart in the accent color, labeled Liked Songs. | Plays your Liked Songs, launching Spotify first if it is not running. Needs `spotify_profile` (below) to start playback; without it, it only opens the Liked Songs page. Shuffle and repeat stay as they are. |
 | `time` | The time into the track, with a ring that fills as it plays, updated every second. | Jumps back 15 seconds. |
 | `previous` | Skip back. | Previous track. |
 | `next` | Skip forward. | Next track. |
@@ -186,10 +186,10 @@ in an ellipsis. Titles do not scroll while paused.
 
 ### Liked Songs key
 
-A `liked` key plays your Liked Songs. It first asks Spotify for
-`spotify:collection:tracks`. If that does not start your Liked Songs, give
-the module your Spotify profile, and the key asks for your own collection
-first:
+A `liked` key plays your Liked Songs, but only once the module knows your
+Spotify profile. Without it, the key can only ask for
+`spotify:collection:tracks`, which in current Spotify opens the Liked Songs
+page without playing anything. To set your profile:
 
 1. In Spotify, click your profile picture and choose **Profile**.
 2. Click the three dots under your name, then **Share**, then **Copy link to
@@ -201,12 +201,13 @@ first:
 spotify_profile = "https://open.spotify.com/user/your-username"
 ```
 
-`spotify_profile` is optional. It also takes a `spotify:user:` URI or the
-user name alone. Anything else (a playlist or track link, for example) puts
-one warning in OpenLogi's log, and the key plays `spotify:collection:tracks`
-only. A key press tries your collection, then `spotify:collection:tracks`,
-and puts one line in the log naming the one that started, or saying neither
-did.
+`spotify_profile` is optional, and needed only for the key to start
+playback. It also takes a `spotify:user:` URI or the user name alone.
+Anything else (a playlist or track link, for example) puts one warning in
+OpenLogi's log, and the key asks for `spotify:collection:tracks` only. A key
+press tries your collection, then `spotify:collection:tracks`, and puts one
+line in the log naming the one that started; when nothing starts and no
+profile is set, that line says the profile link is needed.
 
 While a shuffle, repeat, or time key is bound and a track is loaded, the
 module reads Spotify once a second, so a change made in the Spotify app
@@ -214,14 +215,13 @@ shows within about a second. Only keys whose picture changed are sent.
 
 ## The Automation prompt
 
-The module reads Spotify and plays or pauses it through AppleScript, so the
+The module reads Spotify and plays or pauses it with Apple events, so the
 first time it talks to Spotify, macOS asks whether to allow control of
 Spotify. Click OK. macOS usually names the app that started the module
 (OpenLogi's agent) in that prompt rather than the module itself.
 
-Until the prompt is answered, reads time out and the key keeps its last tile;
-the module starts over with a fresh script after each timeout, so it picks up
-as soon as you answer. If you clicked Don't Allow, OpenLogi's log shows
+Until the prompt is answered, reads time out and the key keeps its last
+tile; the module picks up as soon as you answer. If you clicked Don't Allow, OpenLogi's log shows
 `not allowed to control Spotify ... [-1743]`. Turn it back on in System
 Settings > Privacy & Security > Automation, under the app that asked, then
 toggle Spotify on.
@@ -240,7 +240,7 @@ Rebuilding the module can make macOS ask again.
 
 - **Event driven.** Spotify's `com.spotify.client.PlaybackStateChanged`
   notification and Spotify's launch are wake-ups only: each one, with bursts
-  merged into one read per 250 ms, triggers a single AppleScript read of the
+  merged into one read per 250 ms, triggers a single read of the
   player state and current track, which stays the authority. Spotify quitting
   switches the keys to the app icon tile at once.
 - **Reconcile.** Every 30 seconds the module reads Spotify again and sends the
@@ -262,8 +262,13 @@ Rebuilding the module can make macOS ask again.
 - **Timeouts.** Spotify reads time out after 5 seconds, album art downloads
   after 5 seconds, so a busy Spotify or a slow network cannot hang the keys
   for long.
-- **Never launches Spotify on its own.** It reads Spotify only while Spotify
-  is running; only a key press launches it.
+- **Never launches Spotify on its own.** Every Apple event goes to the
+  running Spotify process by its process id, never to Spotify by name, so an
+  event that reaches a Spotify that is quitting or gone fails instead of
+  starting it again. Once an event fails that way, the module sends that
+  Spotify nothing more until it is gone, a new one starts, or 10 seconds
+  pass. Only a key press launches Spotify: play/pause and Liked Songs, when
+  it is not running.
 
 ## Development
 

@@ -980,10 +980,96 @@ class ModuleTest(unittest.TestCase):
         self.assertEqual((self.state()["state"], self.state()["id"]), ("playing", "liked:" + GENERIC_URI))
         self.assertNotIn("play", calls)
 
+    def test_liked_without_a_profile_says_the_profile_link_is_needed(self):
+        self.walkin(state="paused", dead_uris=[GENERIC_URI])
+        self.press_liked({})
+        self.assertEqual(self.played_uris()[0], GENERIC_URI)
+        failed = [m for m in self.logs("warn") if "Liked Songs" in m]
+        self.assertEqual(len(failed), 1, failed)
+        self.assertIn("only opens the Liked Songs page", failed[0])
+        self.assertIn("set spotify_profile to your Spotify profile link", failed[0])
+
     def test_spotify_profile_forms_are_parsed(self):
         result = subprocess.run([BINARY, "--self-test"], capture_output=True, text=True, timeout=30)
         for check in ("spotify_profile accepts a link, a URI, or a bare name", "spotify_profile rejects anything else"):
             self.assertIn("PASS " + check + "\n", result.stdout)
+
+    # Spotify quitting: nothing but a press ever opens it
+
+    def quit_state(self, **change):
+        """The state file as it is now, changed."""
+        state = self.state()
+        state.update(change)
+        self.set_state(**state)
+
+    def assert_left_alone(self, seconds):
+        """Over `seconds`, Spotify is not opened and gets no event after the one refused."""
+        self.host.drain(seconds)
+        calls = self.calls()
+        self.assertNotIn("launch", calls)
+        self.assertEqual(calls.count("refused"), 1, calls[-12:])
+        self.assertTrue(any("show app icon" in line for line in self.host.stderr_lines), "the keys still show the track")
+
+    def test_spotify_gone_at_its_last_notification_is_not_reopened(self):
+        # The running list still shows Spotify just after it exits.
+        self.playing(artwork=self.position_art())
+        host = self.start(reconcile=0.5)
+        host.keys(self.page())
+        self.keyed_images(9)
+        self.quit_state(exited=True)
+        self.assert_left_alone(3.0)
+        corner = [m for m in host.received if m["type"] == "image" and m["slot"] == "gridTopLeft"][-1]
+        width, height, pixel = read_png(corner["_bytes"])
+        self.assertEqual(pixel(width // 2, height // 2), (0, 0, 0, 255), "the mosaic did not go to the app icon page")
+
+    def test_spotify_gone_when_a_keys_message_arrives_is_not_reopened(self):
+        # Spotify leaves the front as it quits, so OpenLogi switches profiles
+        # and sends new keys within a moment of Spotify exiting.
+        self.playing(artwork=self.position_art())
+        host = self.start(reconcile=0.5)
+        host.keys(self.page())
+        self.keyed_images(9)
+        self.quit_state(exited=True, silent=True)
+        time.sleep(0.06)
+        host.keys([self.slot()])
+        self.assert_left_alone(3.0)
+
+    def test_spotify_quitting_mid_read_is_not_reopened_by_the_ticks(self):
+        self.playing(artwork=self.position_art(), position=30, duration=200000)
+        host = self.start(settings=self.control_page())
+        host.keys(self.page("page2:"))
+        self.keyed_images(9)
+        self.quit_state(quit_after=2)
+        self.assert_left_alone(3.5)
+        # Gone, then a new Spotify: read again, and still never opened by the module.
+        self.quit_state(running=False)
+        host.drain(0.5)
+        self.playing(artwork=self.position_art(), pid=5000, position=30, duration=200000)
+        host.drain(1.5)
+        calls = self.calls()
+        self.assertNotIn("launch", calls)
+        self.assertGreater(calls[calls.index("refused"):].count("read"), 0, "no read of the new Spotify")
+        self.assertEqual(calls.count("refused"), 1)
+
+    def test_a_press_after_spotify_quits_opens_it(self):
+        self.playing(artwork=self.position_art())
+        host = self.start()
+        host.keys([self.slot()])
+        self.image()
+        self.quit_state(exited=True)
+        host.drain(0.6)
+        self.assertNotIn("launch", self.calls())
+        host.press(device="keypad-1", slot="gridMiddle")
+        host.drain(0.6)
+        self.assertEqual(self.calls().count("launch"), 1)
+        self.assertNotIn("playpause", self.calls())
+
+    def test_the_module_never_addresses_spotify_by_name_or_bundle_id(self):
+        with open(os.path.join(HERE, "..", "Sources", "main.swift")) as f:
+            source = f.read()
+        for banned in ("tell application", "NSAppleScript", "osascript", "SBApplication",
+                       "NSAppleEventDescriptor(bundleIdentifier", "application id"):
+            self.assertFalse(banned in source, f"main.swift has {banned!r}")
 
 
 class SelfTest(unittest.TestCase):
@@ -999,8 +1085,7 @@ class SelfTest(unittest.TestCase):
         if not BINARY:
             self.skipTest("MODULE_TEST_BINARY is not set; run zsh tests/run.sh")
         result = subprocess.run([BINARY, "--self-test"], capture_output=True, text=True, timeout=30)
-        for check in ("the album reads return the album name last",
-                      "text keys wrap to at most 3 lines",
+        for check in ("text keys wrap to at most 3 lines",
                       "text key lines fit inside the padding",
                       "a long title gets a smaller size than a short one",
                       "a title that fits is not ellipsized",

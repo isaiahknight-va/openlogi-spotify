@@ -1,28 +1,46 @@
-// Test build only (zsh build.sh --test OUT): a stand-in for Spotify, so the
-// module can be driven end to end without touching the real app. Never part
-// of the shipped binary.
+// Test build only (zsh build.sh --test OUT): a stand-in for the Spotify
+// process. The module's real Apple event code builds and sends every event
+// as it would to Spotify, and this answers it from a file, so the module can
+// be driven end to end without touching the real app. Never part of the
+// shipped binary.
 //
 // State lives in $FAKE_SPOTIFY_DIR/state.json, which tests edit:
-//   {"installed": true, "running": true, "state": "playing" | "paused" | "stopped",
+//   {"installed": true, "running": true, "pid": 4242, "quitting": false, "quit_after": 3,
+//    "exited": false, "silent": false,
+//    "state": "playing" | "paused" | "stopped",
 //    "id": "...", "name": "...", "artist": "...", "artwork": "/path/or/url",
 //    "plays_needed": 3, "read_error": "message",
 //    "shuffling": false, "repeating": false, "position": 12.5, "duration": 200000,
 //    "album": "...", "dead_uris": ["..."], "uri_errors": ["..."]}
-// `play track` with a URI in `dead_uris` is taken but plays nothing, as
-// Spotify does with a URI it cannot play; one in `uri_errors` fails. Any other
-// URI plays its first track, `liked:<uri>`, once `plays_needed` plays have
-// been asked for since the last launch.
+// `quitting` is a Spotify on its way out: still listed as running, but every
+// event to it fails with -609, as a quitting app's do; `quit_after` makes it
+// start quitting after that many more answered events (mid-read). An event to
+// any pid but `pid` fails with -600, and so does every event once `exited`
+// is set: Spotify is gone, though the running list still shows it, as macOS's
+// does for a moment after an app exits. `silent` keeps that write of the file
+// from standing in for a playback notification. `play track` with a URI in `dead_uris` is
+// taken but plays nothing, as Spotify does with a URI it cannot play; one in
+// `uri_errors` fails. Any other URI plays its first track, `liked:<uri>`, once
+// `plays_needed` plays have been asked for since the last launch.
 // `position` is in seconds and advances with the clock from the file's last
 // write while playing; `duration` is in milliseconds, as Spotify reports it.
-// Every call is appended to $FAKE_SPOTIFY_DIR/calls.log, one word per line;
-// a read that asks for the album name adds `album` after its `read`.
+// Calls are appended to $FAKE_SPOTIFY_DIR/calls.log, one word per line: `read`
+// for each player state read, `album`, `playpause`, `play`, `shuffle`,
+// `repeat`, `seek-back`, `next-track`, `previous-track`, `play-uri:<uri>`,
+// `launch` (Spotify opened), and `refused` for an event that failed because
+// Spotify was quitting or gone.
 // A change to state.json stands in for Spotify's playback notification.
 
 import AppKit
 import CoreText
 import Foundation
 
-final class FakeSpotify: SpotifyBackend {
+/// Four letters back from a four-char code.
+func fourLetters(_ code: FourCharCode) -> String {
+    String(bytes: [24, 16, 8, 0].map { UInt8((code >> $0) & 0xFF) }, encoding: .macOSRoman) ?? "????"
+}
+
+final class FakeSpotify: SpotifyProcess {
     // Watched for launch and quit; no real app has this id.
     let bundleID = "com.typ.openlogi.spotify.fake-target"
     let notification = Notification.Name("com.typ.openlogi.spotify.fake.PlaybackStateChanged")
@@ -33,6 +51,7 @@ final class FakeSpotify: SpotifyBackend {
 
     private let dir: String
     private var plays = 0
+    private var answersLeft: Int?
     private var lastModified: Date?
     private var poll: Timer?
 
@@ -46,6 +65,9 @@ final class FakeSpotify: SpotifyBackend {
             let now = self.modified()
             if now != self.lastModified {
                 self.lastModified = now
+                let state = self.load()
+                self.answersLeft = state["quit_after"] as? Int
+                if state["silent"] as? Bool ?? false { return }
                 DistributedNotificationCenter.default().postNotificationName(
                     self.notification, object: nil, userInfo: nil, deliverImmediately: true)
             }
@@ -84,7 +106,11 @@ final class FakeSpotify: SpotifyBackend {
 
     func isInstalled() -> Bool { load()["installed"] as? Bool ?? true }
 
-    func isRunning() -> Bool { load()["running"] as? Bool ?? false }
+    func running() -> (pid: pid_t, launched: Bool)? {
+        let state = load()
+        guard state["running"] as? Bool ?? false else { return nil }
+        return (pid_t(state["pid"] as? Int ?? 4242), true)
+    }
 
     /// The position now: the stored one, plus the time since the file was
     /// written while playing.
@@ -94,128 +120,184 @@ final class FakeSpotify: SpotifyBackend {
         return stored + max(0, Date().timeIntervalSince(written))
     }
 
-    func read(extended: Bool, album: Bool) -> SpotifyState {
-        record("read")
-        if album { record("album") }
-        let state = load()
-        guard state["running"] as? Bool ?? false else { return .notRunning }
-        if let message = state["read_error"] as? String { return .failed(message) }
+    /// The property a specifier the module built names, and whether it is the
+    /// current track's; nil when the specifier is not one Spotify would take.
+    private func property(_ specifier: NSAppleEventDescriptor?) -> (code: String, ofTrack: Bool)? {
+        guard let specifier, specifier.descriptorType == fourCC("obj "),
+              specifier.forKeyword(fourCC("want"))?.typeCodeValue == fourCC("prop"),
+              specifier.forKeyword(fourCC("form"))?.enumCodeValue == fourCC("prop"),
+              let code = specifier.forKeyword(fourCC("seld"))?.typeCodeValue,
+              let from = specifier.forKeyword(fourCC("from")) else { return nil }
+        if from.descriptorType == typeNull { return (fourLetters(code), false) }
+        guard property(from).map({ $0.code == "pTrk" && !$0.ofTrack }) ?? false else { return nil }
+        return (fourLetters(code), true)
+    }
+
+    private func reply(_ value: NSAppleEventDescriptor? = nil) -> NSAppleEventDescriptor {
+        let answer = NSAppleEventDescriptor.appleEvent(
+            withEventClass: fourCC("aevt"), eventID: fourCC("ansr"), targetDescriptor: nil,
+            returnID: AEReturnID(kAutoGenerateReturnID), transactionID: AETransactionID(kAnyTransactionID))
+        if let value { answer.setParam(value, forKeyword: directObject) }
+        return answer
+    }
+
+    /// Answers one event the way Spotify would, from the state file. An event
+    /// to a pid that is not the running one fails with -600; one to a Spotify
+    /// that is quitting (`quitting`, or `quit_after` events answered since the
+    /// file changed) fails with -609. Neither ever starts anything.
+    func send(_ event: NSAppleEventDescriptor, timeout: TimeInterval) throws -> NSAppleEventDescriptor {
+        var state = load()
+        // The address is a 'kpid' descriptor holding the pid, which does not
+        // coerce to an integer.
+        let target = event.attributeDescriptor(forKeyword: fourCC("addr")).flatMap { address -> Int32? in
+            address.descriptorType == fourCC("kpid") && address.data.count == 4
+                ? address.data.withUnsafeBytes { $0.loadUnaligned(as: Int32.self) } : nil
+        }
+        guard state["running"] as? Bool ?? false, !(state["exited"] as? Bool ?? false),
+              target == Int32(state["pid"] as? Int ?? 4242) else {
+            record("refused")
+            throw EventError(number: -600, message: "no such process")
+        }
+        if state["quitting"] as? Bool ?? false || answersLeft == 0 {
+            record("refused")
+            throw EventError(number: -609, message: "connection invalid")
+        }
+        if let left = answersLeft { answersLeft = left - 1 }
+        let direct = event.paramDescriptor(forKeyword: directObject)
         let player = state["state"] as? String ?? "stopped"
-        let id = state["id"] as? String ?? ""
-        guard player != "stopped", !id.isEmpty else { return .idle }
-        var track = Track(id: id, title: state["name"] as? String ?? "", artist: state["artist"] as? String ?? "",
-                          artworkURL: state["artwork"] as? String ?? "", playing: player == "playing")
-        if extended {
-            track.shuffling = state["shuffling"] as? Bool ?? false
-            track.repeating = state["repeating"] as? Bool ?? false
-            track.position = position(state)
-            track.duration = ((state["duration"] as? NSNumber)?.doubleValue ?? 0) / 1000
+        switch (fourLetters(event.eventClass), fourLetters(event.eventID)) {
+        case ("core", "getd"):
+            guard let (code, ofTrack) = property(direct) else { throw EventError(number: -1728, message: "no such object") }
+            if ofTrack {
+                guard player != "stopped", !(state["id"] as? String ?? "").isEmpty else {
+                    throw EventError(number: -1728, message: "no current track")
+                }
+                switch code {
+                case "ID  ": return reply(NSAppleEventDescriptor(string: state["id"] as? String ?? ""))
+                case "pnam": return reply(NSAppleEventDescriptor(string: state["name"] as? String ?? ""))
+                case "pArt": return reply(NSAppleEventDescriptor(string: state["artist"] as? String ?? ""))
+                case "aUrl": return reply(NSAppleEventDescriptor(string: state["artwork"] as? String ?? ""))
+                case "pAlb":
+                    record("album")
+                    return reply(NSAppleEventDescriptor(string: state["album"] as? String ?? ""))
+                case "pDur": return reply(NSAppleEventDescriptor(int32: Int32((state["duration"] as? NSNumber)?.intValue ?? 0)))
+                default: break
+                }
+            } else {
+                switch code {
+                case "pPlS":
+                    record("read")
+                    if let message = state["read_error"] as? String { throw EventError(number: -1712, message: message) }
+                    let codes = ["playing": "kPSP", "paused": "kPSp"]
+                    return reply(NSAppleEventDescriptor(enumCode: fourCC(codes[player] ?? "kPSS")))
+                case "pShu": return reply(NSAppleEventDescriptor(boolean: state["shuffling"] as? Bool ?? false))
+                case "pRep": return reply(NSAppleEventDescriptor(boolean: state["repeating"] as? Bool ?? false))
+                case "pPos": return reply(NSAppleEventDescriptor(double: position(state)))
+                default: break
+                }
+            }
+            throw EventError(number: -1728, message: "no such property \(code)")
+        case ("core", "setd"):
+            guard let (code, ofTrack) = property(direct), !ofTrack,
+                  let value = event.paramDescriptor(forKeyword: fourCC("data")) else {
+                throw EventError(number: -10006, message: "cannot set that")
+            }
+            switch code {
+            case "pShu":
+                record("shuffle")
+                state["shuffling"] = value.booleanValue
+            case "pRep":
+                record("repeat")
+                state["repeating"] = value.booleanValue
+            case "pPos":
+                record("seek-back")
+                state["position"] = value.doubleValue
+            default: throw EventError(number: -10006, message: "cannot set \(code)")
+            }
+            save(state)
+            return reply()
+        case ("spfy", "PlPs"):
+            record("playpause")
+            state["position"] = position(state)
+            state["state"] = player == "playing" ? "paused" : "playing"
+            save(state)
+            return reply()
+        case ("spfy", "Next"):
+            record("next-track")
+            return reply()
+        case ("spfy", "Prev"):
+            record("previous-track")
+            return reply()
+        case ("spfy", "Play"):
+            record("play")
+            plays += 1
+            if plays >= state["plays_needed"] as? Int ?? 1 {
+                state["state"] = "playing"
+                save(state)
+            }
+            return reply()
+        case ("spfy", "PCtx"):
+            let uri = direct?.stringValue ?? ""
+            record("play-uri:" + uri)
+            if (state["uri_errors"] as? [String] ?? []).contains(uri) {
+                throw EventError(number: -10000, message: "cannot play \(uri)")
+            }
+            plays += 1
+            guard plays >= state["plays_needed"] as? Int ?? 1, !(state["dead_uris"] as? [String] ?? []).contains(uri) else {
+                return reply()
+            }
+            state["state"] = "playing"
+            state["id"] = "liked:" + uri
+            state["name"] = "First Liked Song"
+            state["position"] = 0
+            save(state)
+            return reply()
+        default:
+            throw EventError(number: -1708, message: "event not handled")
         }
-        if album { track.album = state["album"] as? String ?? "" }
-        return .track(track)
     }
 
-    func playPause() -> CommandOutcome {
-        record("playpause")
-        var state = load()
-        guard state["running"] as? Bool ?? false else { return .notRunning }
-        state["position"] = position(state)
-        state["state"] = (state["state"] as? String) == "playing" ? "paused" : "playing"
-        save(state)
-        return .done
-    }
-
-    func command(_ command: PlayerCommand) -> CommandOutcome {
-        record(command.rawValue.replacingOccurrences(of: " ", with: "-"))
-        var state = load()
-        guard state["running"] as? Bool ?? false else { return .notRunning }
-        switch command {
-        case .toggleShuffle: state["shuffling"] = !(state["shuffling"] as? Bool ?? false)
-        case .toggleRepeat: state["repeating"] = !(state["repeating"] as? Bool ?? false)
-        case .seekBack: state["position"] = max(0, position(state) - 15)
-        case .previous, .next: return .done
-        }
-        save(state)
-        return .done
-    }
-
-    func playURI(_ uri: String) -> CommandOutcome {
-        record("play-uri:" + uri)
-        var state = load()
-        guard state["running"] as? Bool ?? false else { return .notRunning }
-        if (state["uri_errors"] as? [String] ?? []).contains(uri) { return .failed("cannot play \(uri) [-10000]") }
-        plays += 1
-        guard plays >= state["plays_needed"] as? Int ?? 1, !(state["dead_uris"] as? [String] ?? []).contains(uri) else {
-            return .done
-        }
-        state["state"] = "playing"
-        state["id"] = "liked:" + uri
-        state["name"] = "First Liked Song"
-        state["position"] = 0
-        save(state)
-        return .done
-    }
-
-    func launch() -> CommandOutcome {
+    func open() -> String? {
         record("launch")
         var state = load()
         state["running"] = true
         save(state)
         plays = 0
-        return .done
-    }
-
-    func tryPlay() -> Bool {
-        record("play")
-        var state = load()
-        plays += 1
-        guard plays >= state["plays_needed"] as? Int ?? 1 else { return false }
-        state["state"] = "playing"
-        save(state)
-        return true
+        return nil
     }
 }
 
-/// Checks the Script wrapper with scripts that need no app, so no Automation
-/// prompt can appear: a -1712 drops the compiled script, any other error
-/// keeps it. Prints PASS or FAIL lines and exits non-zero on any failure.
+/// Checks that need neither Spotify nor OpenLogi. Prints PASS or FAIL lines
+/// and exits non-zero on any failure.
 func runSelfTest() -> Never {
     var failures = 0
     func check(_ name: String, _ condition: Bool) {
         print("\(condition ? "PASS" : "FAIL") \(name)")
         if !condition { failures += 1 }
     }
-    let timeout = Script("error \"timed out\" number -1712")
-    _ = timeout.run()
-    _ = timeout.run()
-    _ = timeout.run()
-    check("a -1712 recompiles before the next run (3 runs, 3 compiles)", timeout.compiles == 3)
-    if case .failure(let error) = timeout.run() {
-        check("the -1712 error number is reported", error.number == -1712)
-    } else {
-        check("the -1712 error number is reported", false)
-    }
-
-    let other = Script("error \"something else\" number -2700")
-    _ = other.run()
-    _ = other.run()
-    check("another error keeps the compiled script (2 runs, 1 compile)", other.compiles == 1)
-
-    let ok = Script("return \"fine\"")
-    _ = ok.run()
-    if case .success(let result) = ok.run() {
-        check("a good script runs and is compiled once", result.stringValue == "fine" && ok.compiles == 1)
-    } else {
-        check("a good script runs and is compiled once", false)
-    }
-
-    let permission = ScriptError(number: -1743, message: "x")
+    let permission = EventError(number: -1743, message: "x")
     check("-1743 explains the Automation setting", permission.description.contains("Automation"))
 
-    check("the album reads return the album name last",
-          readAlbumSource.contains("album of current track") && readAlbumSource.contains("artworkURL, trackAlbum}")
-          && readExtendedAlbumSource.contains("durationValue, trackAlbum}")
-          && !readSource.contains("album of") && !readExtendedSource.contains("album of"))
+    // The real send, to a process that has exited: it fails as gone, and
+    // nothing is launched (no app is named, so none could be).
+    let exited = Process()
+    exited.executableURL = URL(fileURLWithPath: "/usr/bin/true")
+    try? exited.run()
+    exited.waitUntilExit()
+    var gone = false
+    do {
+        _ = try RealSpotify().send(appleEvent("spfy", "PlPs", to: exited.processIdentifier), timeout: 2)
+    } catch let error as EventError {
+        gone = error.meansGone
+    } catch {}
+    check("an event to an exited process fails as gone", gone)
+
+    let specifier = property("aUrl", of: property("pTrk"))
+    check("a property specifier names its property and its container",
+          specifier.descriptorType == fourCC("obj ")
+          && specifier.forKeyword(fourCC("seld"))?.typeCodeValue == fourCC("aUrl")
+          && specifier.forKeyword(fourCC("from"))?.forKeyword(fourCC("seld"))?.typeCodeValue == fourCC("pTrk")
+          && specifier.forKeyword(fourCC("from"))?.forKeyword(fourCC("from"))?.descriptorType == typeNull)
 
     // The song, artist, and album keys' text at 118 px: 98 px inside the padding.
     let box = CGSize(width: 98, height: 98)

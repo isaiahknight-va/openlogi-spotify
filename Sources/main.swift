@@ -899,57 +899,51 @@ func pngData(_ image: CGImage) -> Data? {
     return data as Data
 }
 
-// MARK: - AppleScript
+// MARK: - Apple events
 
-struct ScriptError: Error {
-    var number: Int?
+/// A failed Apple event: its error number and message.
+struct EventError: Error {
+    var number: Int
     var message: String
 
     var description: String {
         if number == -1743 {
             return "not allowed to control Spotify (System Settings > Privacy & Security > Automation) [-1743]"
         }
-        return "\(message) [\(number.map(String.init) ?? "?")]"
+        return "\(message) [\(number)]"
     }
+
+    /// -600 (no such process) and -609 (connection gone): what a Spotify that
+    /// is quitting or has quit answers.
+    var meansGone: Bool { number == -600 || number == -609 }
 }
 
-/// One AppleScript, compiled on first use and kept. A -1712 (the event timed
-/// out, usually because an Automation prompt is still waiting for an answer)
-/// leaves the instance stuck, so it is dropped and compiled again before the
-/// next run. NSAppleScript is main-thread only: call `run` on the main queue.
-final class Script {
-    let source: String
-    private var compiled: NSAppleScript?
-    private(set) var compiles = 0
+func fourCC(_ code: String) -> FourCharCode { code.utf8.reduce(0) { $0 << 8 | FourCharCode($1) } }
 
-    init(_ source: String) {
-        self.source = source
-    }
+let directObject = fourCC("----")
 
-    func run() -> Result<NSAppleEventDescriptor, ScriptError> {
-        if compiled == nil {
-            let script = NSAppleScript(source: source)
-            var error: NSDictionary?
-            compiles += 1
-            guard let script, script.compileAndReturnError(&error) else {
-                return .failure(scriptError(error, prefix: "AppleScript compile failed: "))
-            }
-            compiled = script
-        }
-        var error: NSDictionary?
-        guard let result = compiled?.executeAndReturnError(&error), error == nil else {
-            let failure = scriptError(error, prefix: "")
-            if failure.number == -1712 { compiled = nil }
-            return .failure(failure)
-        }
-        return .success(result)
-    }
+/// An object specifier for property `code` of `container` (the application
+/// when null), as AppleScript's `code of container` would build it.
+func property(_ code: String, of container: NSAppleEventDescriptor = .null()) -> NSAppleEventDescriptor {
+    let specifier = NSAppleEventDescriptor.record().coerce(toDescriptorType: fourCC("obj "))!
+    specifier.setDescriptor(NSAppleEventDescriptor(typeCode: fourCC("prop")), forKeyword: fourCC("want"))
+    specifier.setDescriptor(NSAppleEventDescriptor(enumCode: fourCC("prop")), forKeyword: fourCC("form"))
+    specifier.setDescriptor(NSAppleEventDescriptor(typeCode: fourCC(code)), forKeyword: fourCC("seld"))
+    specifier.setDescriptor(container, forKeyword: fourCC("from"))
+    return specifier
+}
 
-    private func scriptError(_ error: NSDictionary?, prefix: String) -> ScriptError {
-        let number = error?[NSAppleScript.errorNumber] as? Int
-        let message = error?[NSAppleScript.errorMessage] as? String ?? "no message"
-        return ScriptError(number: number, message: prefix + message)
-    }
+/// An Apple event addressed to process `pid` alone. Unlike a script that
+/// addresses Spotify by name or bundle id, it can never launch anything: sent
+/// to a Spotify that is quitting or gone, it fails.
+func appleEvent(_ eventClass: String, _ eventID: String, to pid: pid_t,
+                direct: NSAppleEventDescriptor? = nil) -> NSAppleEventDescriptor {
+    let event = NSAppleEventDescriptor.appleEvent(
+        withEventClass: fourCC(eventClass), eventID: fourCC(eventID),
+        targetDescriptor: NSAppleEventDescriptor(processIdentifier: pid),
+        returnID: AEReturnID(kAutoGenerateReturnID), transactionID: AETransactionID(kAnyTransactionID))
+    if let direct { event.setParam(direct, forKeyword: directObject) }
+    return event
 }
 
 // MARK: - Spotify
@@ -990,7 +984,7 @@ enum PlayerCommand: String {
     case next = "next track"
 }
 
-/// Everything the module asks of Spotify. The test build swaps in a fake.
+/// Everything the module asks of Spotify.
 protocol SpotifyBackend: AnyObject {
     /// The app whose launch and quit the module watches.
     var bundleID: String { get }
@@ -1006,252 +1000,227 @@ protocol SpotifyBackend: AnyObject {
     /// `play track` with a Spotify URI; done means Spotify took the command,
     /// not that anything started.
     func playURI(_ uri: String) -> CommandOutcome
+    /// Opens Spotify: only ever for a key press.
     func launch() -> CommandOutcome
     /// One `play`; true once the player reports playing.
     func tryPlay() -> Bool
 }
 
-// Every script below starts with an `is running` guard where a bare `tell`
-// would launch Spotify, and carries a timeout so a busy or still-launching
-// Spotify cannot hold the main queue for the default 2 minutes.
-// Variable names avoid `st` and other words Spotify's dictionary reserves.
-let readReturn = "return {stateText, trackID, trackName, trackArtist, artworkURL}"
-let readSource = """
-if application id "com.spotify.client" is running then
-  with timeout of 5 seconds
-    tell application id "com.spotify.client"
-        set stateText to "stopped"
-        if player state is playing then
-            set stateText to "playing"
-        else if player state is paused then
-            set stateText to "paused"
-        end if
-        set trackID to ""
-        set trackName to ""
-        set trackArtist to ""
-        set artworkURL to ""
-        try
-            set theTrack to current track
-            set trackID to (id of theTrack) as text
-            set trackName to (name of theTrack) as text
-            set trackArtist to (artist of theTrack) as text
-        end try
-        try
-            set artworkURL to (artwork url of current track) as text
-        end try
-        \(readReturn)
-    end tell
-  end timeout
-end if
-return {}
-"""
-
-// The same read plus shuffle, repeat, position (seconds), and duration
-// (milliseconds, whatever Spotify's dictionary says).
-let readExtendedSource = readSource.replacingOccurrences(of: readReturn, with: """
-set shuffleState to false
-        set repeatState to false
-        set positionSeconds to 0
-        set durationValue to 0
-        try
-            set shuffleState to shuffling
-            set repeatState to repeating
-            set positionSeconds to player position
-        end try
-        try
-            set durationValue to duration of current track
-        end try
-        return {stateText, trackID, trackName, trackArtist, artworkURL, shuffleState, repeatState, positionSeconds, durationValue}
-""")
-
-/// `source` (either read above) with the album name read too, returned last.
-func withAlbum(_ source: String) -> String {
-    let start = source.range(of: "return {stateText")!
-    let end = source.range(of: "}", range: start.upperBound..<source.endIndex)!
-    let albumLines = """
-    set trackAlbum to ""
-            try
-                set trackAlbum to (album of current track) as text
-            end try
-
-    """
-    return String(source[..<start.lowerBound]) + albumLines + "        " + String(source[start.lowerBound..<end.lowerBound])
-        + ", trackAlbum}" + String(source[end.upperBound...])
+/// The Spotify process. The test build swaps in a fake that answers the same
+/// Apple events from a file.
+protocol SpotifyProcess: AnyObject {
+    var bundleID: String { get }
+    var notification: Notification.Name { get }
+    func isInstalled() -> Bool
+    /// The running, not terminated Spotify, and whether it finished launching.
+    func running() -> (pid: pid_t, launched: Bool)?
+    /// Sends `event` and waits up to `timeout` seconds for the reply. Throws
+    /// an EventError, also for an error in the reply.
+    func send(_ event: NSAppleEventDescriptor, timeout: TimeInterval) throws -> NSAppleEventDescriptor
+    /// Opens Spotify with NSWorkspace; nil, or why it failed.
+    func open() -> String?
 }
 
-let readAlbumSource = withAlbum(readSource)
-let readExtendedAlbumSource = withAlbum(readExtendedSource)
-
-func commandSource(_ command: PlayerCommand) -> String {
-    let body: String
-    switch command {
-    case .toggleShuffle: body = "set shuffling to not shuffling"
-    case .toggleRepeat: body = "set repeating to not repeating"
-    case .seekBack:
-        body = """
-        set newPosition to (player position) - 15
-              if newPosition < 0 then set newPosition to 0
-              set player position to newPosition
-        """
-    case .previous: body = "previous track"
-    case .next: body = "next track"
-    }
-    return """
-    if application id "com.spotify.client" is running then
-      with timeout of 5 seconds
-        tell application id "com.spotify.client"
-          \(body)
-        end tell
-      end timeout
-      return "done"
-    end if
-    return "not running"
-    """
-}
-
-/// Only for URIs built from checked parts (see `profileUser`): the URI
-/// goes into the script as is.
-func playURISource(_ uri: String) -> String {
-    """
-    if application id "com.spotify.client" is running then
-      with timeout of 5 seconds
-        tell application id "com.spotify.client" to play track "\(uri)"
-      end timeout
-      return "done"
-    end if
-    return "not running"
-    """
-}
-
-let playPauseSource = """
-if application id "com.spotify.client" is running then
-  with timeout of 5 seconds
-    tell application id "com.spotify.client" to playpause
-  end timeout
-  return "done"
-end if
-return "not running"
-"""
-
-let launchSource = """
-with timeout of 10 seconds
-  tell application id "com.spotify.client" to launch
-end timeout
-"""
-
-let tryPlaySource = """
-if application id "com.spotify.client" is running then
-  with timeout of 2 seconds
-    tell application id "com.spotify.client"
-        play
-        if player state is playing then return "playing"
-    end tell
-  end timeout
-end if
-return "waiting"
-"""
-
-final class SpotifyReader: SpotifyBackend {
+final class RealSpotify: SpotifyProcess {
     let bundleID = spotifyBundleID
     let notification = spotifyNotification
-    private let reader = Script(readSource)
-    private let extendedReader = Script(readExtendedSource)
-    private let albumReader = Script(readAlbumSource)
-    private let extendedAlbumReader = Script(readExtendedAlbumSource)
-    private var commandScripts: [String: Script] = [:]
-    private var uriScripts: [String: Script] = [:]
-    private let playPauseScript = Script(playPauseSource)
-    private let launchScript = Script(launchSource)
-    private let tryPlayScript = Script(tryPlaySource)
 
     func isInstalled() -> Bool {
-        NSWorkspace.shared.urlForApplication(withBundleIdentifier: spotifyBundleID) != nil
+        NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) != nil
     }
 
-    func isRunning() -> Bool {
-        NSRunningApplication.runningApplications(withBundleIdentifier: spotifyBundleID)
-            .contains { !$0.isTerminated }
+    func running() -> (pid: pid_t, launched: Bool)? {
+        NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first { !$0.isTerminated }
+            .map { ($0.processIdentifier, $0.isFinishedLaunching) }
+    }
+
+    func send(_ event: NSAppleEventDescriptor, timeout: TimeInterval) throws -> NSAppleEventDescriptor {
+        let reply: NSAppleEventDescriptor
+        do {
+            reply = try event.sendEvent(options: [.waitForReply], timeout: timeout)
+        } catch {
+            let failure = error as NSError
+            throw EventError(number: failure.code, message: failure.localizedDescription)
+        }
+        if let number = reply.paramDescriptor(forKeyword: fourCC("errn"))?.int32Value, number != 0 {
+            throw EventError(number: Int(number),
+                             message: reply.paramDescriptor(forKeyword: fourCC("errs"))?.stringValue ?? "Spotify reported an error")
+        }
+        return reply
+    }
+
+    func open() -> String? {
+        guard let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) else {
+            return "Spotify is not installed"
+        }
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = false
+        let done = DispatchSemaphore(value: 0)
+        var failure: String?
+        NSWorkspace.shared.openApplication(at: url, configuration: configuration) { _, error in
+            failure = error?.localizedDescription
+            done.signal()
+        }
+        if done.wait(timeout: .now() + 10) == .timedOut { return "Spotify did not open within 10 seconds" }
+        return failure
+    }
+}
+
+let exchangeTimeout: TimeInterval = 5     // all the events of one read or command
+let quitHold: TimeInterval = 10
+
+/// Spotify through Apple events sent to its process by pid; the only way the
+/// module starts Spotify is `launch`, for a key press. Once an event fails as
+/// a quitting app's do, that process is sent nothing more until it is gone,
+/// another starts, or `quitHold` passes, so nothing waits on a dying Spotify.
+final class SpotifyReader: SpotifyBackend {
+    let process: SpotifyProcess
+    private var quitting: (pid: pid_t, at: Date)?
+
+    init(_ process: SpotifyProcess) {
+        self.process = process
+    }
+
+    var bundleID: String { process.bundleID }
+    var notification: Notification.Name { process.notification }
+
+    func isInstalled() -> Bool { process.isInstalled() }
+
+    func isRunning() -> Bool { target() != nil }
+
+    /// The process to talk to; nil while none runs or it is quitting.
+    func target() -> pid_t? {
+        guard let app = process.running() else {
+            quitting = nil
+            return nil
+        }
+        if let quitting, quitting.pid == app.pid, Date().timeIntervalSince(quitting.at) < quitHold { return nil }
+        quitting = nil
+        return app.pid
+    }
+
+    /// Sends the events of one exchange; they share one time budget.
+    final class Sender {
+        let process: SpotifyProcess
+        let deadline: Date
+
+        init(_ process: SpotifyProcess, timeout: TimeInterval) {
+            self.process = process
+            deadline = Date().addingTimeInterval(timeout)
+        }
+
+        func callAsFunction(_ event: NSAppleEventDescriptor) throws -> NSAppleEventDescriptor {
+            try process.send(event, timeout: max(0.5, deadline.timeIntervalSinceNow))
+        }
+    }
+
+    /// Runs `body` with a `send` whose events share one budget of `timeout`
+    /// seconds; the first failure ends the exchange. A failure that means the
+    /// process `pid` is going away marks it quitting, once it finished
+    /// launching (a starting Spotify may refuse early events).
+    private func exchange<T>(_ pid: pid_t, timeout: TimeInterval = exchangeTimeout,
+                             _ body: (_ send: Sender) throws -> T) -> Result<T, EventError> {
+        do {
+            return .success(try body(Sender(process, timeout: timeout)))
+        } catch let error as EventError {
+            if error.meansGone, let app = process.running(), app.pid == pid, app.launched { quitting = (pid, Date()) }
+            return .failure(error)
+        } catch {
+            return .failure(EventError(number: -1, message: "\(error)"))
+        }
     }
 
     func read(extended: Bool, album: Bool) -> SpotifyState {
-        guard isRunning() else { return .notRunning }
-        let script = album ? (extended ? extendedAlbumReader : albumReader) : (extended ? extendedReader : reader)
-        switch script.run() {
-        case .failure(let error):
-            // -600 and -609: Spotify quit between the running check and the
-            // read (it posts one last playback notification as it quits).
-            if error.number == -600 || error.number == -609 || !isRunning() { return .notRunning }
-            return .failed("AppleScript failed: \(error.description)")
-        case .success(let result):
-            guard result.numberOfItems >= 5 else { return .notRunning }
-            func item(_ i: Int) -> String { result.atIndex(i)?.stringValue ?? "" }
-            let state = item(1)
-            let id = item(2)
-            guard state != "stopped", !id.isEmpty else { return .idle }
-            var track = Track(id: id, title: item(3), artist: item(4), artworkURL: item(5), playing: state == "playing")
-            if extended, result.numberOfItems >= 9 {
-                track.shuffling = result.atIndex(6)?.booleanValue ?? false
-                track.repeating = result.atIndex(7)?.booleanValue ?? false
-                track.position = max(0, result.atIndex(8)?.doubleValue ?? 0)
+        guard let pid = target() else { return .notRunning }
+        let result = exchange(pid) { send -> SpotifyState in
+            func get(_ code: String, ofTrack: Bool = false) throws -> NSAppleEventDescriptor? {
+                let event = appleEvent("core", "getd", to: pid, direct: property(code, of: ofTrack ? property("pTrk") : .null()))
+                do {
+                    return try send(event).paramDescriptor(forKeyword: directObject)
+                } catch let error as EventError where error.number == -1728 {
+                    return nil       // no current track
+                }
+            }
+            let state = try get("pPlS")?.enumCodeValue
+            guard state == fourCC("kPSP") || state == fourCC("kPSp") else { return .idle }
+            let id = try get("ID  ", ofTrack: true)?.stringValue ?? ""
+            guard !id.isEmpty else { return .idle }
+            var track = try Track(id: id, title: get("pnam", ofTrack: true)?.stringValue ?? "",
+                                  artist: get("pArt", ofTrack: true)?.stringValue ?? "",
+                                  artworkURL: get("aUrl", ofTrack: true)?.stringValue ?? "", playing: state == fourCC("kPSP"))
+            if extended {
+                track.shuffling = try get("pShu")?.booleanValue ?? false
+                track.repeating = try get("pRep")?.booleanValue ?? false
+                track.position = try max(0, get("pPos")?.doubleValue ?? 0)
                 // Milliseconds in practice; taken as seconds only when that
                 // would put the position past the end.
-                let duration = result.atIndex(9)?.doubleValue ?? 0
+                let duration = try get("pDur", ofTrack: true)?.doubleValue ?? 0
                 track.duration = duration / 1000 >= track.position ? duration / 1000 : duration
             }
-            let albumIndex = extended ? 10 : 6
-            if album, result.numberOfItems >= albumIndex {
-                track.album = item(albumIndex)
-            }
+            if album { track.album = try get("pAlb", ofTrack: true)?.stringValue ?? "" }
             return .track(track)
+        }
+        switch result {
+        case .success(let state): return state
+        case .failure(let error):
+            // -600 and -609: Spotify quit, or began to, during the read (it
+            // posts one last playback notification as it quits).
+            if error.meansGone || target() == nil { return .notRunning }
+            return .failed("Apple event failed: \(error.description)")
+        }
+    }
+
+    /// One command exchange; notRunning when no Spotify is running, it is
+    /// quitting, or it went away.
+    private func run(_ body: (pid_t, Sender) throws -> Void) -> CommandOutcome {
+        guard let pid = target() else { return .notRunning }
+        switch exchange(pid, { send in try body(pid, send) }) {
+        case .success: return .done
+        case .failure(let error): return error.meansGone || target() == nil ? .notRunning : .failed(error.description)
         }
     }
 
     func command(_ command: PlayerCommand) -> CommandOutcome {
-        let script = commandScripts[command.rawValue] ?? Script(commandSource(command))
-        commandScripts[command.rawValue] = script
-        switch script.run() {
-        case .failure(let error):
-            if error.number == -600 || error.number == -609 { return .notRunning }
-            return .failed(error.description)
-        case .success(let result):
-            return result.stringValue == "done" ? .done : .notRunning
+        run { pid, send in
+            /// Sets an application property to `next` of its current value.
+            func update(_ code: String, _ next: (NSAppleEventDescriptor?) -> NSAppleEventDescriptor) throws {
+                let value = try send(appleEvent("core", "getd", to: pid, direct: property(code))).paramDescriptor(forKeyword: directObject)
+                let set = appleEvent("core", "setd", to: pid, direct: property(code))
+                set.setParam(next(value), forKeyword: fourCC("data"))
+                _ = try send(set)
+            }
+            switch command {
+            case .toggleShuffle: try update("pShu") { NSAppleEventDescriptor(boolean: !($0?.booleanValue ?? false)) }
+            case .toggleRepeat: try update("pRep") { NSAppleEventDescriptor(boolean: !($0?.booleanValue ?? false)) }
+            case .seekBack: try update("pPos") { NSAppleEventDescriptor(double: max(0, ($0?.doubleValue ?? 0) - 15)) }
+            case .previous: _ = try send(appleEvent("spfy", "Prev", to: pid))
+            case .next: _ = try send(appleEvent("spfy", "Next", to: pid))
+            }
         }
     }
 
     func playURI(_ uri: String) -> CommandOutcome {
-        let script = uriScripts[uri] ?? Script(playURISource(uri))
-        uriScripts[uri] = script
-        switch script.run() {
-        case .failure(let error):
-            if error.number == -600 || error.number == -609 { return .notRunning }
-            return .failed(error.description)
-        case .success(let result):
-            return result.stringValue == "done" ? .done : .notRunning
-        }
+        run { pid, send in _ = try send(appleEvent("spfy", "PCtx", to: pid, direct: NSAppleEventDescriptor(string: uri))) }
     }
 
     func playPause() -> CommandOutcome {
-        switch playPauseScript.run() {
-        case .failure(let error):
-            if error.number == -600 || error.number == -609 { return .notRunning }
-            return .failed(error.description)
-        case .success(let result):
-            return result.stringValue == "done" ? .done : .notRunning
-        }
+        run { pid, send in _ = try send(appleEvent("spfy", "PlPs", to: pid)) }
     }
 
     func launch() -> CommandOutcome {
-        switch launchScript.run() {
-        case .failure(let error): return .failed(error.description)
-        case .success: return .done
-        }
+        process.open().map { .failed($0) } ?? .done
     }
 
     func tryPlay() -> Bool {
         // Errors while Spotify is still starting are expected; the next try
-        // asks again, as the tested script's `try` block did.
-        if case .success(let result) = tryPlayScript.run() { return result.stringValue == "playing" }
-        return false
+        // asks again.
+        guard let pid = target() else { return false }
+        let playing = exchange(pid, timeout: 2) { send -> Bool in
+            _ = try send(appleEvent("spfy", "Play", to: pid))
+            let state = try send(appleEvent("core", "getd", to: pid, direct: property("pPlS")))
+            return state.paramDescriptor(forKeyword: directObject)?.enumCodeValue == fourCC("kPSP")
+        }
+        return (try? playing.get()) ?? false
     }
 }
 
@@ -1555,7 +1524,7 @@ struct Settings {
 /// (https://open.spotify.com/user/NAME?si=..., with or without the scheme or
 /// an /intl-xx/ part), a spotify:user:NAME URI, or a bare NAME. Nil unless the
 /// name is 1 to 64 ASCII letters, digits, dots, underscores, or hyphens, which
-/// makes it safe to put in a URI and an AppleScript as is.
+/// makes it safe to put in a Spotify URI as is.
 func profileUser(_ value: Any) -> String? {
     guard var text = (value as? String)?.trimmingCharacters(in: .whitespaces) else { return nil }
     if text.hasPrefix("spotify:user:") {
@@ -1633,7 +1602,7 @@ func parseSettings(_ value: Any?) -> (settings: Settings, problems: [String]) {
 }
 
 /// All Spotify reads, presses, and renders run on the main queue, which is
-/// serial, so they never overlap; NSAppleScript also wants the main thread.
+/// serial, so they never overlap.
 final class Controller {
     let backend: SpotifyBackend
     let cache: RenderCache
@@ -2040,6 +2009,9 @@ final class Controller {
         retry(tries: tries, step: { [unowned self] in self.likedStep() }) { [unowned self] _, _ in
             if let played = self.likedPlay?.played {
                 self.output.report("info", "Liked Songs: playing \(played)")
+            } else if uris.count == 1 {
+                self.output.report("warn", "Liked Songs did not start playing: \(uris[0]) only opens the Liked Songs "
+                    + "page; set spotify_profile to your Spotify profile link to start playback")
             } else {
                 self.output.report("warn", "Liked Songs did not start; tried \(uris.joined(separator: " then "))")
             }
@@ -2096,7 +2068,7 @@ final class Controller {
         guard active, now >= nextAttemptAt else { return }
         switch backend.read(extended: needsExtendedRead, album: needsAlbumRead) {
         case .failed(let message):
-            // The same AppleScript error on every reconcile would flood the log.
+            // The same error on every reconcile would flood the log.
             if message != lastReadError || now.timeIntervalSince(lastReadErrorAt) >= artRetryInterval {
                 output.report("error", "reading Spotify: \(message)")
                 lastReadError = message
@@ -2667,10 +2639,10 @@ let cacheOverride = ProcessInfo.processInfo.environment["SPOTIFY_MODULE_CACHE_DI
 #if FAKE_SPOTIFY
 // Test build only (build.sh --test): tests/FakeSpotify.swift supplies these.
 if arguments == ["--self-test"] { runSelfTest() }
-let backend: SpotifyBackend = FakeSpotify()
+let backend: SpotifyBackend = SpotifyReader(FakeSpotify())
 let reconcileInterval = FakeSpotify.reconcileInterval
 #else
-let backend: SpotifyBackend = SpotifyReader()
+let backend: SpotifyBackend = SpotifyReader(RealSpotify())
 let reconcileInterval: TimeInterval = 30
 #endif
 
