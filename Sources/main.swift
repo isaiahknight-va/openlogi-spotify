@@ -53,6 +53,10 @@ let cachePruneTarget = 250
 // renders are not reused.
 let renderVersion = "tile-v3"
 let mosaicVersion = "mosaic-v1"
+let controlVersion = "control-v1"
+let tickInterval: TimeInterval = 1
+let defaultBannerFps: Double = 3
+let bannerFpsRange: ClosedRange<Double> = 0...8
 // A page's nine grid keys in reading order; all nine bound on one page and
 // one device make a mosaic.
 let gridSlots = ["gridTopLeft", "gridTopMiddle", "gridTopRight", "gridMiddleLeft", "gridMiddle",
@@ -357,6 +361,365 @@ func renderBlackTile(size: Int) -> CGImage? {
     return context.makeImage()
 }
 
+// MARK: - Control keys
+
+/// What a bound key shows and does. `art` is the full tile; the rest make up
+/// a control page (settings `keys`).
+enum Role: String {
+    case art, title, shuffle, `repeat`, time, previous, next
+
+    /// The command a press sends; nil for the play/pause keys.
+    var command: PlayerCommand? {
+        switch self {
+        case .shuffle: return .toggleShuffle
+        case .repeat: return .toggleRepeat
+        case .time: return .seekBack
+        case .previous: return .previous
+        case .next: return .next
+        case .art, .title: return nil
+        }
+    }
+}
+
+let neutralAccent = CGColor(srgbRed: 0.82, green: 0.82, blue: 0.84, alpha: 1)
+let scrollSpeed: CGFloat = 30      // pixels a second on a 118 px key
+let scrollPause: Double = 2
+
+func hsv(_ r: Double, _ g: Double, _ b: Double) -> (h: Double, s: Double, v: Double) {
+    let high = max(r, g, b)
+    let d = high - min(r, g, b)
+    guard d > 0 else { return (0, 0, high) }
+    var h = high == r ? (g - b) / d : high == g ? 2 + (b - r) / d : 4 + (r - g) / d
+    h /= 6
+    if h < 0 { h += 1 }
+    return (h, d / high, high)
+}
+
+func rgb(_ h: Double, _ s: Double, _ v: Double) -> CGColor {
+    let i = Int(h * 6) % 6
+    let f = h * 6 - Double(Int(h * 6))
+    let p = v * (1 - s), q = v * (1 - f * s), t = v * (1 - (1 - f) * s)
+    let (r, g, b) = [(v, t, p), (q, v, p), (p, v, t), (p, q, v), (t, p, v), (v, p, q)][i]
+    return CGColor(srgbRed: r, green: g, blue: b, alpha: 1)
+}
+
+/// The cover drawn small and box-blurred (smooth once scaled up, and cheap),
+/// plus its accent: the average color of its strongest saturated hue,
+/// brightened to read on a dark key. A gray cover gets the neutral accent.
+func coverSample(_ art: CGImage) -> (blurred: CGImage, accent: CGColor)? {
+    let side = 36
+    guard let context = CGContext(
+        data: nil, width: side, height: side, bitsPerComponent: 8, bytesPerRow: side * 4,
+        space: sRGB, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+    ), let data = context.data else { return nil }
+    context.interpolationQuality = .high
+    drawAspectFill(art, in: CGRect(x: 0, y: 0, width: side, height: side), context: context)
+    let pixels = data.bindMemory(to: UInt8.self, capacity: side * side * 4)
+
+    var weights = [Double](repeating: 0, count: 12)
+    var sums = [[Double]](repeating: [0, 0, 0], count: 12)
+    for i in 0..<(side * side) {
+        let r = Double(pixels[i * 4]) / 255, g = Double(pixels[i * 4 + 1]) / 255, b = Double(pixels[i * 4 + 2]) / 255
+        let color = hsv(r, g, b)
+        guard color.s > 0.3, color.v > 0.25 else { continue }
+        let bucket = min(11, Int(color.h * 12))
+        let weight = color.s * color.v
+        weights[bucket] += weight
+        sums[bucket] = [sums[bucket][0] + r * weight, sums[bucket][1] + g * weight, sums[bucket][2] + b * weight]
+    }
+    var accent = neutralAccent
+    if let best = weights.indices.max(by: { weights[$0] < weights[$1] }), weights[best] >= Double(side * side) * 0.03 {
+        let w = weights[best]
+        let color = hsv(sums[best][0] / w, sums[best][1] / w, sums[best][2] / w)
+        accent = rgb(color.h, min(max(color.s, 0.55), 0.85), max(color.v, 0.92))
+    }
+
+    var values = (0..<(side * side * 4)).map { Float(pixels[$0]) }
+    let radius = 2
+    func pass(horizontal: Bool) {
+        var out = values
+        for y in 0..<side {
+            for x in 0..<side {
+                for c in 0..<4 {
+                    var total: Float = 0
+                    for d in -radius...radius {
+                        let xx = horizontal ? min(max(x + d, 0), side - 1) : x
+                        let yy = horizontal ? y : min(max(y + d, 0), side - 1)
+                        total += values[(yy * side + xx) * 4 + c]
+                    }
+                    out[(y * side + x) * 4 + c] = total / Float(2 * radius + 1)
+                }
+            }
+        }
+        values = out
+    }
+    for _ in 0..<3 {
+        pass(horizontal: true)
+        pass(horizontal: false)
+    }
+    for i in values.indices { pixels[i] = UInt8(min(255, max(0, values[i].rounded()))) }
+    guard let blurred = context.makeImage() else { return nil }
+    return (blurred, accent)
+}
+
+/// The background of a control page: the cover blurred and darkened over the
+/// canvas of nine keys and their gaps (like a mosaic), so each key shows its
+/// own part of it and a banner runs straight across its keys. Without a
+/// cover: the title's gradient, or plain dark when nothing is loaded. Paused:
+/// grayscale and dimmed like a tile.
+func renderControlBackground(art: CGImage?, seed: String?, paused: Bool, side: Int) -> (canvas: CGImage, accent: CGColor)? {
+    guard let context = CGContext(
+        data: nil, width: side, height: side, bitsPerComponent: 8, bytesPerRow: 0,
+        space: sRGB, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+    ) else { return nil }
+    context.interpolationQuality = .high
+    let s = CGFloat(side)
+    let full = CGRect(x: 0, y: 0, width: s, height: s)
+    var accent = neutralAccent
+    if let art, let sample = coverSample(art) {
+        accent = sample.accent
+        context.draw(sample.blurred, in: full)
+    } else if let seed {
+        drawFallbackBackground(seed, size: s, context: context)
+    } else {
+        let plain = CGGradient(
+            colorsSpace: sRGB,
+            colors: [CGColor(srgbRed: 0.14, green: 0.14, blue: 0.15, alpha: 1),
+                     CGColor(srgbRed: 0.05, green: 0.05, blue: 0.06, alpha: 1)] as CFArray,
+            locations: [0, 1])!
+        context.drawLinearGradient(plain, start: CGPoint(x: 0, y: s), end: CGPoint(x: 0, y: 0), options: [])
+    }
+    context.setFillColor(black(0.4))
+    context.fill(full)
+    guard var canvas = context.makeImage() else { return nil }
+    if paused, let gray = grayscale(canvas, size: side) {
+        context.draw(gray, in: full)
+        context.setFillColor(black(0.42))
+        context.fill(full)
+        canvas = context.makeImage() ?? canvas
+    }
+    return (canvas, accent)
+}
+
+/// The part of a page canvas under grid key `index` (and the `count` - 1
+/// keys to its right, for a banner), gaps included.
+func pageCrop(_ canvas: CGImage, index: Int, count: Int = 1, size: Int, gap: Int) -> CGImage? {
+    let row = index / 3, col = index % 3
+    return canvas.cropping(to: CGRect(x: col * (size + gap), y: row * (size + gap),
+                                      width: count * size + (count - 1) * gap, height: size))
+}
+
+func formatTime(_ seconds: Int) -> String {
+    let h = seconds / 3600, m = seconds / 60 % 60, s = seconds % 60
+    return h > 0 ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%d:%02d", m, s)
+}
+
+/// What a control key shows; `key` names it for caching and change checks.
+struct ControlState {
+    var role: Role
+    var enabled = false          // a track is loaded
+    var on = false               // shuffle or repeat
+    var elapsed = 0              // seconds
+    var duration = 0.0           // seconds
+
+    var key: String { "\(role.rawValue) \(enabled) \(on) \(elapsed) \(Int(duration))" }
+}
+
+func strokeIcon(_ path: CGPath, color: CGColor, width: CGFloat, context: CGContext) {
+    context.setStrokeColor(color)
+    context.setLineWidth(width)
+    context.setLineCap(.round)
+    context.setLineJoin(.round)
+    context.addPath(path)
+    context.strokePath()
+}
+
+/// A chevron whose tip is `tip`, pointing right (or left).
+func addArrowhead(_ path: CGMutablePath, tip: CGPoint, length: CGFloat, pointingLeft: Bool = false) {
+    let back = pointingLeft ? length : -length
+    path.move(to: CGPoint(x: tip.x + back, y: tip.y + length))
+    path.addLine(to: tip)
+    path.addLine(to: CGPoint(x: tip.x + back, y: tip.y - length))
+}
+
+func drawShuffleIcon(center: CGPoint, k: CGFloat, color: CGColor, context: CGContext) {
+    let w = 40 * k, h = 24 * k
+    let left = center.x - w / 2, right = center.x + w / 2
+    let path = CGMutablePath()
+    for (from, to) in [(center.y - h / 2, center.y + h / 2), (center.y + h / 2, center.y - h / 2)] {
+        path.move(to: CGPoint(x: left, y: from))
+        path.addLine(to: CGPoint(x: left + w * 0.2, y: from))
+        path.addCurve(to: CGPoint(x: right - w * 0.2, y: to),
+                      control1: CGPoint(x: left + w * 0.5, y: from), control2: CGPoint(x: right - w * 0.5, y: to))
+        path.addLine(to: CGPoint(x: right, y: to))
+        addArrowhead(path, tip: CGPoint(x: right, y: to), length: 6.5 * k)
+    }
+    strokeIcon(path, color: color, width: 3.4 * k, context: context)
+}
+
+func drawRepeatIcon(center: CGPoint, k: CGFloat, color: CGColor, context: CGContext) {
+    let w = 38 * k, h = 24 * k
+    let rect = CGRect(x: center.x - w / 2, y: center.y - h / 2, width: w, height: h)
+    let path = CGMutablePath(roundedRect: rect, cornerWidth: 9 * k, cornerHeight: 9 * k, transform: nil)
+    addArrowhead(path, tip: CGPoint(x: rect.midX + 5 * k, y: rect.maxY), length: 6 * k)
+    addArrowhead(path, tip: CGPoint(x: rect.midX - 5 * k, y: rect.minY), length: 6 * k, pointingLeft: true)
+    strokeIcon(path, color: color, width: 3.4 * k, context: context)
+}
+
+/// Two triangles and a bar: next, or mirrored, previous.
+func drawSkipIcon(forward: Bool, center: CGPoint, k: CGFloat, color: CGColor, context: CGContext) {
+    context.saveGState()
+    if !forward {
+        context.translateBy(x: 2 * center.x, y: 0)
+        context.scaleBy(x: -1, y: 1)
+    }
+    let w = 16 * k, h = 22 * k, bar = 4.5 * k
+    let left = center.x - (2 * w + bar) / 2
+    let path = CGMutablePath()
+    for i in 0..<2 {
+        let x = left + CGFloat(i) * w
+        path.move(to: CGPoint(x: x, y: center.y + h / 2))
+        path.addLine(to: CGPoint(x: x + w, y: center.y))
+        path.addLine(to: CGPoint(x: x, y: center.y - h / 2))
+        path.closeSubpath()
+    }
+    path.addRect(CGRect(x: left + 2 * w, y: center.y - h / 2, width: bar, height: h))
+    context.setFillColor(color)
+    context.addPath(path)
+    context.fillPath()
+    context.restoreGState()
+}
+
+/// One control key: its icon (or the time and its ring) over its part of the
+/// page background. White; shuffle and repeat in the accent when on and
+/// faint when off; everything dimmed with nothing loaded.
+func renderControl(_ state: ControlState, background: CGImage, accent: CGColor, size: Int) -> CGImage? {
+    guard let context = CGContext(
+        data: nil, width: size, height: size, bitsPerComponent: 8, bytesPerRow: 0,
+        space: sRGB, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+    ) else { return nil }
+    context.interpolationQuality = .high
+    let s = CGFloat(size)
+    let k = s / 118
+    context.draw(background, in: CGRect(x: 0, y: 0, width: s, height: s))
+    let toggle = state.role == .shuffle || state.role == .repeat
+    let color = !state.enabled ? white(0.3) : !toggle ? white(1) : state.on ? accent : white(0.5)
+
+    func label(_ text: String) {
+        let line = CTLineCreateWithAttributedString(attributed(text, font: font(size: 13 * k, weight: .medium), color: color))
+        let width = CGFloat(CTLineGetTypographicBounds(line, nil, nil, nil))
+        context.textPosition = CGPoint(x: (s - width) / 2, y: 22 * k)
+        CTLineDraw(line, context)
+        if state.on && state.enabled {
+            let bar = CGRect(x: s / 2 - 11 * k, y: 13 * k, width: 22 * k, height: 2.5 * k)
+            context.setFillColor(accent)
+            context.addPath(CGPath(roundedRect: bar, cornerWidth: 1.25 * k, cornerHeight: 1.25 * k, transform: nil))
+            context.fillPath()
+        }
+    }
+
+    let iconCenter = CGPoint(x: s / 2, y: s * 0.6)
+    switch state.role {
+    case .shuffle:
+        drawShuffleIcon(center: iconCenter, k: k, color: color, context: context)
+        label("Shuffle")
+    case .repeat:
+        drawRepeatIcon(center: iconCenter, k: k, color: color, context: context)
+        label("Repeat")
+    case .previous, .next:
+        drawSkipIcon(forward: state.role == .next, center: CGPoint(x: s / 2, y: s / 2), k: k, color: color, context: context)
+    case .time:
+        let center = CGPoint(x: s / 2, y: s / 2)
+        let radius = 41 * k
+        context.setLineWidth(5 * k)
+        context.setLineCap(.round)
+        context.setStrokeColor(white(0.16))
+        context.strokeEllipse(in: CGRect(x: center.x - radius, y: center.y - radius, width: 2 * radius, height: 2 * radius))
+        let progress = state.duration > 0 ? min(1, Double(state.elapsed) / state.duration) : 0
+        if state.enabled && progress > 0 {
+            context.setStrokeColor(accent)
+            context.addArc(center: center, radius: radius, startAngle: .pi / 2,
+                           endAngle: .pi / 2 - 2 * .pi * CGFloat(progress), clockwise: true)
+            context.strokePath()
+        }
+        let text = formatTime(state.enabled ? state.elapsed : 0)
+        let line = CTLineCreateWithAttributedString(attributed(
+            text, font: font(size: (text.count > 5 ? 19 : 25) * k, weight: .bold), color: state.enabled ? white(1) : white(0.3)))
+        let bounds = CTLineGetBoundsWithOptions(line, .useGlyphPathBounds)
+        context.textPosition = CGPoint(x: center.x - bounds.midX, y: center.y - bounds.midY)
+        CTLineDraw(line, context)
+    case .art, .title:
+        break
+    }
+    return context.makeImage()
+}
+
+/// The title at the largest size from 30 down to 19 (per 118 px key) that
+/// fits `width`, and how wide it is there.
+func fitTitle(_ title: String, width: CGFloat, k: CGFloat) -> (font: CTFont, width: CGFloat) {
+    var size: CGFloat = 30
+    while true {
+        let titleFont = font(size: size * k, weight: .bold)
+        let line = CTLineCreateWithAttributedString(attributed(title, font: titleFont, color: white(1)))
+        let lineWidth = CGFloat(CTLineGetTypographicBounds(line, nil, nil, nil))
+        if lineWidth <= width || size <= 19 { return (titleFont, lineWidth) }
+        size -= 1
+    }
+}
+
+/// Where a scrolling title is `elapsed` seconds into its cycle: still for
+/// 2 s, then `speed` pixels a second to its end, still for 2 s, and back.
+func scrollOffset(elapsed: Double, distance: CGFloat, speed: CGFloat) -> CGFloat {
+    let travel = Double(distance / speed)
+    let t = elapsed.truncatingRemainder(dividingBy: scrollPause + travel + scrollPause)
+    if t < scrollPause { return 0 }
+    if t < scrollPause + travel { return CGFloat(t - scrollPause) * speed }
+    return distance
+}
+
+/// A title banner across one to three keys of a row: the title over the
+/// artist, left aligned, on the banner's part of the page background (as
+/// wide as the banner, gaps included). With `offset` the title is drawn that
+/// far left, clipped to the banner, to scroll; without it a title too long
+/// at the smallest size ends in an ellipsis. The artist truncates.
+func renderBanner(title: String, artist: String, background: CGImage, size: Int, offset: CGFloat?) -> CGImage? {
+    let width = background.width
+    guard let context = CGContext(
+        data: nil, width: width, height: size, bitsPerComponent: 8, bytesPerRow: 0,
+        space: sRGB, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+    ) else { return nil }
+    let s = CGFloat(size)
+    let k = s / 118
+    let w = CGFloat(width)
+    context.draw(background, in: CGRect(x: 0, y: 0, width: w, height: s))
+    let pad = 12 * k
+    let available = w - 2 * pad
+    let fit = fitTitle(title, width: available, k: k)
+    var titleLine = CTLineCreateWithAttributedString(attributed(title, font: fit.font, color: white(1)))
+    if fit.width > available && offset == nil {
+        let token = CTLineCreateWithAttributedString(attributed("\u{2026}", font: fit.font, color: white(1)))
+        titleLine = CTLineCreateTruncatedLine(titleLine, Double(available), .end, token) ?? titleLine
+    }
+    let artistFont = font(size: 17 * k, weight: .regular)
+    let artistLines = artist.isEmpty ? [] :
+        layoutLines(attributed(artist, font: artistFont, color: white(0.85)), width: available, maxLines: 1)
+
+    let titleHeight = CTFontGetAscent(fit.font) + CTFontGetDescent(fit.font)
+    let artistHeight = artistLines.isEmpty ? 0 : CTFontGetAscent(artistFont) + CTFontGetDescent(artistFont) + 3 * k
+    let bottom = (s - titleHeight - artistHeight) / 2
+    context.setShadow(offset: CGSize(width: 0, height: -0.75 * k), blur: 2.5 * k, color: black(0.7))
+    for line in artistLines {
+        context.textPosition = CGPoint(x: pad, y: bottom + CTFontGetDescent(artistFont))
+        CTLineDraw(line, context)
+    }
+    context.saveGState()
+    if offset != nil { context.clip(to: CGRect(x: pad / 2, y: 0, width: w - pad, height: s)) }
+    context.textPosition = CGPoint(x: pad - (offset ?? 0), y: bottom + artistHeight + CTFontGetDescent(fit.font))
+    CTLineDraw(titleLine, context)
+    context.restoreGState()
+    return context.makeImage()
+}
+
 /// A white play triangle with softened corners, nudged right of `center` so
 /// it looks centered (its visual mass sits left of its bounding box's middle).
 func drawPlayTriangle(center: CGPoint, height: CGFloat, context: CGContext) {
@@ -504,6 +867,11 @@ struct Track {
     var artist: String
     var artworkURL: String
     var playing: Bool
+    // Read only while a shuffle, repeat, or time key is bound.
+    var shuffling = false
+    var repeating = false
+    var position: Double = 0     // seconds
+    var duration: Double = 0     // seconds
 }
 
 enum SpotifyState {
@@ -519,6 +887,15 @@ enum CommandOutcome {
     case failed(String)
 }
 
+/// What the control keys ask of Spotify; each one only while it is running.
+enum PlayerCommand: String {
+    case toggleShuffle = "shuffle"
+    case toggleRepeat = "repeat"
+    case seekBack = "seek back"
+    case previous = "previous track"
+    case next = "next track"
+}
+
 /// Everything the module asks of Spotify. The test build swaps in a fake.
 protocol SpotifyBackend: AnyObject {
     /// The app whose launch and quit the module watches.
@@ -527,8 +904,10 @@ protocol SpotifyBackend: AnyObject {
     var notification: Notification.Name { get }
     func isInstalled() -> Bool
     func isRunning() -> Bool
-    func read() -> SpotifyState
+    /// `extended` also reads shuffle, repeat, position, and duration.
+    func read(extended: Bool) -> SpotifyState
     func playPause() -> CommandOutcome
+    func command(_ command: PlayerCommand) -> CommandOutcome
     func launch() -> CommandOutcome
     /// One `play`; true once the player reports playing.
     func tryPlay() -> Bool
@@ -538,6 +917,7 @@ protocol SpotifyBackend: AnyObject {
 // would launch Spotify, and carries a timeout so a busy or still-launching
 // Spotify cannot hold the main queue for the default 2 minutes.
 // Variable names avoid `st` and other words Spotify's dictionary reserves.
+let readReturn = "return {stateText, trackID, trackName, trackArtist, artworkURL}"
 let readSource = """
 if application id "com.spotify.client" is running then
   with timeout of 5 seconds
@@ -561,12 +941,57 @@ if application id "com.spotify.client" is running then
         try
             set artworkURL to (artwork url of current track) as text
         end try
-        return {stateText, trackID, trackName, trackArtist, artworkURL}
+        \(readReturn)
     end tell
   end timeout
 end if
 return {}
 """
+
+// The same read plus shuffle, repeat, position (seconds), and duration
+// (milliseconds, whatever Spotify's dictionary says).
+let readExtendedSource = readSource.replacingOccurrences(of: readReturn, with: """
+set shuffleState to false
+        set repeatState to false
+        set positionSeconds to 0
+        set durationValue to 0
+        try
+            set shuffleState to shuffling
+            set repeatState to repeating
+            set positionSeconds to player position
+        end try
+        try
+            set durationValue to duration of current track
+        end try
+        return {stateText, trackID, trackName, trackArtist, artworkURL, shuffleState, repeatState, positionSeconds, durationValue}
+""")
+
+func commandSource(_ command: PlayerCommand) -> String {
+    let body: String
+    switch command {
+    case .toggleShuffle: body = "set shuffling to not shuffling"
+    case .toggleRepeat: body = "set repeating to not repeating"
+    case .seekBack:
+        body = """
+        set newPosition to (player position) - 15
+              if newPosition < 0 then set newPosition to 0
+              set player position to newPosition
+        """
+    case .previous: body = "previous track"
+    case .next: body = "next track"
+    }
+    return """
+    if application id "com.spotify.client" is running then
+      with timeout of 5 seconds
+        tell application id "com.spotify.client"
+          \(body)
+        end tell
+      end timeout
+      return "done"
+    end if
+    return "not running"
+    """
+}
 
 let playPauseSource = """
 if application id "com.spotify.client" is running then
@@ -600,6 +1025,8 @@ final class SpotifyReader: SpotifyBackend {
     let bundleID = spotifyBundleID
     let notification = spotifyNotification
     private let reader = Script(readSource)
+    private let extendedReader = Script(readExtendedSource)
+    private var commandScripts: [String: Script] = [:]
     private let playPauseScript = Script(playPauseSource)
     private let launchScript = Script(launchSource)
     private let tryPlayScript = Script(tryPlaySource)
@@ -613,9 +1040,9 @@ final class SpotifyReader: SpotifyBackend {
             .contains { !$0.isTerminated }
     }
 
-    func read() -> SpotifyState {
+    func read(extended: Bool) -> SpotifyState {
         guard isRunning() else { return .notRunning }
-        switch reader.run() {
+        switch (extended ? extendedReader : reader).run() {
         case .failure(let error):
             // -600 and -609: Spotify quit between the running check and the
             // read (it posts one last playback notification as it quits).
@@ -627,7 +1054,29 @@ final class SpotifyReader: SpotifyBackend {
             let state = item(1)
             let id = item(2)
             guard state != "stopped", !id.isEmpty else { return .idle }
-            return .track(Track(id: id, title: item(3), artist: item(4), artworkURL: item(5), playing: state == "playing"))
+            var track = Track(id: id, title: item(3), artist: item(4), artworkURL: item(5), playing: state == "playing")
+            if extended, result.numberOfItems >= 9 {
+                track.shuffling = result.atIndex(6)?.booleanValue ?? false
+                track.repeating = result.atIndex(7)?.booleanValue ?? false
+                track.position = max(0, result.atIndex(8)?.doubleValue ?? 0)
+                // Milliseconds in practice; taken as seconds only when that
+                // would put the position past the end.
+                let duration = result.atIndex(9)?.doubleValue ?? 0
+                track.duration = duration / 1000 >= track.position ? duration / 1000 : duration
+            }
+            return .track(track)
+        }
+    }
+
+    func command(_ command: PlayerCommand) -> CommandOutcome {
+        let script = commandScripts[command.rawValue] ?? Script(commandSource(command))
+        commandScripts[command.rawValue] = script
+        switch script.run() {
+        case .failure(let error):
+            if error.number == -600 || error.number == -609 { return .notRunning }
+            return .failed(error.description)
+        case .success(let result):
+            return result.stringValue == "done" ? .done : .notRunning
         }
     }
 
@@ -697,6 +1146,11 @@ final class RenderCache {
     func mosaicPath(for key: TrackKey, art: String, gap: Int, position: Int, size: Int) -> String {
         path(for: "\(mosaicVersion)\n\(key.id)\n\(art)\n\(key.playing ? "playing" : "paused")\n\(gap)\n\(position)",
              size: size)
+    }
+
+    /// A control key face, named by everything it shows.
+    func controlPath(_ name: String, size: Int) -> String {
+        path(for: "\(controlVersion)\n\(name)", size: size)
     }
 
     private func path(for name: String, size: Int) -> String {
@@ -838,39 +1292,107 @@ struct MosaicGroup: Hashable {
     var slots: [String] { gridSlots.map { page + $0 } }
 }
 
-/// Splits the bound keys into full pages (mosaics) and the rest, which keep
-/// one full tile each. Mosaics come in the order their pages first appear.
-func groupSlots(_ slots: [Slot]) -> (mosaics: [MosaicGroup], singles: [Slot]) {
+/// A run of `title` keys side by side in one row of one page: one banner.
+struct Banner: Hashable {
+    var device: String
+    var page: String
+    var first: Int          // grid index of its leftmost key
+    var count: Int          // 1 to 3
+    var size: Int
+
+    var slots: [String] { (first..<first + count).map { page + gridSlots[$0] } }
+}
+
+/// A shuffle, repeat, time, previous, or next key.
+struct Control: Hashable {
+    var device: String
+    var slot: String
+    var size: Int
+    var role: Role
+    var index: Int          // its grid position
+}
+
+/// "page2:gridMiddle" is ("page2:", "gridMiddle"); "gridMiddle" is ("", "gridMiddle").
+func splitSlot(_ slot: String) -> (page: String, name: String) {
+    guard let colon = slot.firstIndex(of: ":") else { return ("", slot) }
+    return (String(slot[...colon]), String(slot[slot.index(after: colon)...]))
+}
+
+struct Layout {
+    var mosaics: [MosaicGroup] = []
+    var singles: [Slot] = []
+    var banners: [Banner] = []
+    var controls: [Control] = []
+}
+
+/// Sorts the bound keys: full pages whose keys are all `art` (mosaics), title
+/// banners, control keys, and the rest, which keep one full tile each. Roles
+/// apply to grid slots only. Mosaics come in the order their pages first appear.
+func groupSlots(_ slots: [Slot], roles: [String: Role] = [:]) -> Layout {
+    func role(_ slot: Slot) -> Role {
+        gridSlots.contains(splitSlot(slot.slot).name) ? roles[slot.slot] ?? .art : .art
+    }
     var pages: [String: [String: Slot]] = [:]
     var order: [(device: String, page: String)] = []
     for slot in slots {
-        let colon = slot.slot.firstIndex(of: ":")
-        let page = colon.map { String(slot.slot[...$0]) } ?? ""
-        let name = colon.map { String(slot.slot[slot.slot.index(after: $0)...]) } ?? slot.slot
+        let (page, name) = splitSlot(slot.slot)
         guard gridSlots.contains(name) else { continue }
         let id = slot.device + "\n" + page
         if pages[id] == nil { order.append((slot.device, page)) }
         pages[id, default: [:]][name] = slot
     }
-    var mosaics: [MosaicGroup] = []
+    var layout = Layout()
     var taken: Set<String> = []
     for (device, page) in order {
         let keys = pages[device + "\n" + page] ?? [:]
-        guard keys.count == gridSlots.count, let center = keys[gridSlots[centerIndex]] else { continue }
-        mosaics.append(MosaicGroup(device: device, page: page, size: center.size))
+        guard keys.count == gridSlots.count, let center = keys[gridSlots[centerIndex]],
+              keys.values.allSatisfy({ role($0) == .art }) else { continue }
+        layout.mosaics.append(MosaicGroup(device: device, page: page, size: center.size))
         for name in gridSlots { taken.insert(device + "\n" + page + name) }
     }
-    return (mosaics, slots.filter { !taken.contains($0.device + "\n" + $0.slot) })
+    var titles: [String: [(index: Int, slot: Slot)]] = [:]
+    var titleOrder: [String] = []
+    for slot in slots where !taken.contains(slot.device + "\n" + slot.slot) {
+        let (page, name) = splitSlot(slot.slot)
+        let slotRole = role(slot)
+        guard slotRole != .art, let index = gridSlots.firstIndex(of: name) else {
+            layout.singles.append(slot)
+            continue
+        }
+        if slotRole == .title {
+            let row = slot.device + "\n" + page + "\n\(index / 3)"
+            if titles[row] == nil { titleOrder.append(row) }
+            titles[row, default: []].append((index, slot))
+        } else {
+            layout.controls.append(Control(device: slot.device, slot: slot.slot, size: slot.size, role: slotRole, index: index))
+        }
+    }
+    for row in titleOrder {
+        for (index, slot) in titles[row]!.sorted(by: { $0.index < $1.index }) {
+            let page = splitSlot(slot.slot).page
+            if var last = layout.banners.last, last.device == slot.device, last.page == page,
+               last.first + last.count == index, index % 3 != 0 {
+                last.count += 1
+                layout.banners[layout.banners.count - 1] = last
+            } else {
+                layout.banners.append(Banner(device: slot.device, page: page, first: index, count: 1, size: slot.size))
+            }
+        }
+    }
+    return layout
 }
 
 struct Settings {
     var gapPercent = defaultGapPercent
     var staggerMs = defaultStaggerMs
+    var bannerFps = defaultBannerFps
+    var roles: [String: Role] = [:]
 }
 
 /// The `settings` table from `hello`. A missing key takes its default; a
 /// value that is not a number takes the default and one out of range is
-/// clamped. Each problem, and each unknown key, is listed in `problems`.
+/// clamped; a `keys` role that is not a role is `art`. Each problem, and
+/// each unknown key, is listed in `problems`.
 func parseSettings(_ value: Any?) -> (settings: Settings, problems: [String]) {
     var settings = Settings()
     var problems: [String] = []
@@ -893,7 +1415,22 @@ func parseSettings(_ value: Any?) -> (settings: Settings, problems: [String]) {
     }
     settings.gapPercent = number("mosaic_gap_percent", gapPercentRange, defaultGapPercent)
     settings.staggerMs = number("mosaic_stagger_ms", staggerMsRange, defaultStaggerMs)
-    for key in table.keys.sorted() where key != "mosaic_gap_percent" && key != "mosaic_stagger_ms" {
+    settings.bannerFps = number("banner_fps", bannerFpsRange, defaultBannerFps)
+    if let raw = table["keys"] {
+        if let map = raw as? [String: Any] {
+            for slot in map.keys.sorted() {
+                if let name = map[slot] as? String, let role = Role(rawValue: name) {
+                    settings.roles[slot] = role
+                } else {
+                    problems.append("keys \(slot) = \(map[slot]!) is not a role; using art")
+                }
+            }
+        } else {
+            problems.append("keys is not a table; using art for every key")
+        }
+    }
+    let known: Set = ["mosaic_gap_percent", "mosaic_stagger_ms", "banner_fps", "keys"]
+    for key in table.keys.sorted() where !known.contains(key) {
         problems.append("ignoring unknown setting \(key)")
     }
     return (settings, problems)
@@ -910,9 +1447,15 @@ final class Controller {
     var slots: [Slot] = []
     var mosaics: [MosaicGroup] = []
     var singles: [Slot] = []
+    var banners: [Banner] = []
+    var controls: [Control] = []
     var size = defaultSize
     var active: Bool { !slots.isEmpty }
     var settings = Settings()
+    var hasRoles: Bool { !banners.isEmpty || !controls.isEmpty }
+    /// Keys drawn one by one rather than with one image_all.
+    var perKey: Bool { !mosaics.isEmpty || hasRoles }
+    var needsExtendedRead: Bool { controls.contains { $0.role == .shuffle || $0.role == .repeat || $0.role == .time } }
 
     var shown = Shown.unknown
     var shownDisplay: Display?
@@ -920,6 +1463,12 @@ final class Controller {
     var shownTiles: [MosaicGroup: [Data]] = [:]
     var shownIsFallback = false
     var revealItems: [DispatchWorkItem] = []
+    var roleDisplay: Display?
+    var roleFaces: [String: (key: String, png: Data)] = [:]    // by device and slot
+    var palettes: [String: (canvas: CGImage, accent: CGColor)] = [:]
+    var scrollStarts: [Banner: (title: String, at: Date)] = [:]
+    var bannerTimer: Timer?
+    var trackLoaded = false
     var failures = 0
     var nextAttemptAt = Date.distantPast
     var lastReadError: String?
@@ -938,6 +1487,7 @@ final class Controller {
     var pendingReconcile = false
     var observers: [(NotificationCenter, NSObjectProtocol)] = []
     var reconcileTimer: Timer?
+    var tickTimer: Timer?
 
     init(backend: SpotifyBackend, cache: RenderCache, output: Output, reconcileInterval: TimeInterval) {
         self.backend = backend
@@ -956,14 +1506,15 @@ final class Controller {
         let parsed = parseSettings(message["settings"])
         settings = parsed.settings
         if !parsed.problems.isEmpty { output.report("warn", "settings: " + parsed.problems.joined(separator: "; ")) }
-        log("mosaic gap \(settings.gapPercent)%, stagger \(settings.staggerMs) ms")
+        log("mosaic gap \(settings.gapPercent)%, stagger \(settings.staggerMs) ms, banner \(settings.bannerFps) fps, "
+            + "\(settings.roles.count) key roles")
         start()
     }
 
     func handle(_ type: String, _ message: [String: Any]) {
         switch type {
         case "keys": updateKeys(message["keys"])
-        case "pressed": press()
+        case "pressed": press(slot: message["slot"] as? String)
         default:
             if unknownTypes.insert(type).inserted { log("ignoring unknown message type \(type)") }
         }
@@ -981,12 +1532,17 @@ final class Controller {
             next.append(Slot(device: device, slot: slot, size: size))
         }
         let wasActive = active
-        let hadMosaic = !mosaics.isEmpty
+        let hadPerKey = perKey
         guard next != slots else { return }
         slots = next
-        (mosaics, singles) = groupSlots(slots)
+        let layout = groupSlots(slots, roles: settings.roles)
+        (mosaics, singles, banners, controls) = (layout.mosaics, layout.singles, layout.banners, layout.controls)
+        // A keys message wants every key drawn again.
+        roleFaces = [:]
+        if !hasRoles { setBannerTimer(false) }
         log("keys: \(slots.isEmpty ? "none" : slots.map { "\($0.slot)@\($0.size)" }.joined(separator: " "))"
-            + mosaics.map { " (mosaic \($0.device) \($0.page.isEmpty ? "page1:" : $0.page))" }.joined())
+            + mosaics.map { " (mosaic \($0.device) \($0.page.isEmpty ? "page1:" : $0.page))" }.joined()
+            + (hasRoles ? " (\(banners.count) banners, \(controls.count) controls)" : ""))
         guard let first = singles.first ?? slots.first else {
             deactivate()
             return
@@ -995,7 +1551,7 @@ final class Controller {
             // Nothing was tracked while idle, and a new size needs a new render.
             size = first.size
             forgetShown()
-        } else if hadMosaic || !mosaics.isEmpty, let display = shownDisplay {
+        } else if hadPerKey || perKey, let display = shownDisplay {
             // A page that became or stopped being a mosaic is drawn again at
             // once, all nine keys together.
             show(display, quiet: true, now: Date())
@@ -1003,6 +1559,7 @@ final class Controller {
             // A newly bound slot gets the current face at once.
             sendImage(png)
         }
+        if hasRoles, let display = roleDisplay { updateRoles(display, force: true, now: Date()) }
         schedule(after: 0, reconcile: false)
     }
 
@@ -1021,6 +1578,10 @@ final class Controller {
         shownDisplay = nil
         shownPNG = nil
         shownTiles = [:]
+        roleDisplay = nil
+        roleFaces = [:]
+        scrollStarts = [:]
+        setBannerTimer(false)
     }
 
     func sendImage(_ png: Data) {
@@ -1042,7 +1603,7 @@ final class Controller {
     /// reveal still under way.
     func paint(single: Data?, tiles: [MosaicGroup: [Data]], reveal: Set<MosaicGroup>) {
         cancelReveal()
-        if mosaics.isEmpty {
+        if !perKey {
             if let single { sendImage(single) }
             return
         }
@@ -1080,7 +1641,7 @@ final class Controller {
     /// The unchanged face again, all at once. A reveal under way sends the
     /// rest of the mosaic keys itself.
     func resend() {
-        if mosaics.isEmpty {
+        if !perKey {
             if let png = shownPNG { sendImage(png) }
             return
         }
@@ -1108,6 +1669,7 @@ final class Controller {
         }
         observe(workspace, NSWorkspace.didTerminateApplicationNotification) { [unowned self] note in
             guard self.isWatched(note), self.active else { return }
+            self.trackLoaded = false
             self.apply(.appIcon, reconcile: false, now: Date())
         }
         let timer = Timer(timeInterval: reconcileInterval, repeats: true) { [unowned self] _ in
@@ -1115,6 +1677,13 @@ final class Controller {
         }
         RunLoop.main.add(timer, forMode: .common)
         reconcileTimer = timer
+        // Shuffle, repeat, and the time follow Spotify once a second while
+        // such a key is bound and a track is loaded.
+        let tick = Timer(timeInterval: tickInterval, repeats: true) { [unowned self] _ in
+            if self.needsExtendedRead && self.trackLoaded { self.schedule(after: 0, reconcile: false) }
+        }
+        RunLoop.main.add(tick, forMode: .common)
+        tickTimer = tick
     }
 
     func observe(_ center: NotificationCenter, _ name: Notification.Name, _ handler: @escaping (Notification) -> Void) {
@@ -1150,6 +1719,29 @@ final class Controller {
     }
 
     // MARK: Presses
+
+    /// A control key sends its command, only while Spotify is running, and
+    /// is drawn again from a fresh read; every other key plays or pauses.
+    func press(slot: String?) {
+        guard let slot, gridSlots.contains(splitSlot(slot).name),
+              let role = settings.roles[slot], let command = role.command else {
+            press()
+            return
+        }
+        guard backend.isRunning() else {
+            log("press ignored: \(role.rawValue) needs Spotify running")
+            return
+        }
+        switch backend.command(command) {
+        case .done:
+            log("press: \(command.rawValue)")
+            schedule(after: 0, reconcile: false)
+        case .notRunning:
+            log("press ignored: \(role.rawValue) needs Spotify running")
+        case .failed(let message):
+            output.report("error", "\(command.rawValue) failed: \(message)")
+        }
+    }
 
     /// Spotify running: play/pause. Not running: launch it and press play
     /// until it reports playing (40 tries, 0.25 s apart), one try per main
@@ -1206,7 +1798,7 @@ final class Controller {
     /// Reads Spotify once and brings the keys in line.
     func perform(reconcile: Bool, now: Date = Date()) {
         guard active, now >= nextAttemptAt else { return }
-        switch backend.read() {
+        switch backend.read(extended: needsExtendedRead) {
         case .failed(let message):
             // The same AppleScript error on every reconcile would flood the log.
             if message != lastReadError || now.timeIntervalSince(lastReadErrorAt) >= artRetryInterval {
@@ -1216,9 +1808,11 @@ final class Controller {
             }
         case .notRunning, .idle:
             lastReadError = nil
+            trackLoaded = false
             apply(.appIcon, reconcile: reconcile, now: now)
         case .track(let track):
             lastReadError = nil
+            trackLoaded = true
             apply(.track(track), reconcile: reconcile, now: now)
         }
     }
@@ -1242,10 +1836,11 @@ final class Controller {
                 resend()
             }
         }
+        if hasRoles { updateRoles(display, force: reconcile, now: now) }
     }
 
     var faceMissing: Bool {
-        ((mosaics.isEmpty || !singles.isEmpty) && shownPNG == nil) || mosaics.contains { shownTiles[$0] == nil }
+        ((!perKey || !singles.isEmpty) && shownPNG == nil) || mosaics.contains { shownTiles[$0] == nil }
     }
 
     func succeeded() {
@@ -1406,7 +2001,7 @@ final class Controller {
         var single: Data?
         var fallback = false
         var source = "cached"
-        if mosaics.isEmpty || !singles.isEmpty {
+        if !perKey || !singles.isEmpty {
             guard let face = face(display, size: size, now: now) else { return }
             (single, fallback, source) = (face.png, face.fallback, face.source)
         }
@@ -1438,6 +2033,158 @@ final class Controller {
             case .appIcon:
                 log("show app icon (\(source))")
             }
+        }
+    }
+
+    // MARK: Control keys
+
+    /// The page background and accent for control keys at `size`, kept per
+    /// cover, paused state, and size.
+    func palette(_ display: Display, size: Int, now: Date) -> (key: String, canvas: CGImage, accent: CGColor)? {
+        var art: CGImage?
+        var seed: String?
+        var name = "none"
+        var paused = false
+        if case .track(let track) = display {
+            art = artwork(for: track.artworkURL, now: now)
+            seed = track.title + "\n" + track.artist
+            name = art != nil ? "art \(track.artworkURL)" : "seed \(track.title)\n\(track.artist)"
+            paused = !track.playing
+        }
+        let gap = mosaicGap(size: size)
+        let key = "\(name)\n\(paused)\n\(size)\n\(gap)"
+        if let hit = palettes[key] { return (key, hit.canvas, hit.accent) }
+        guard let made = renderControlBackground(art: art, seed: seed, paused: paused, side: 3 * size + 2 * gap) else {
+            failed("rendering the control background", now: now)
+            return nil
+        }
+        if palettes.count >= 8 { palettes = [:] }
+        palettes[key] = made
+        return (key, made.canvas, made.accent)
+    }
+
+    func controlState(_ role: Role, _ display: Display) -> ControlState {
+        var state = ControlState(role: role)
+        guard case .track(let track) = display else { return state }
+        state.enabled = true
+        state.on = role == .shuffle ? track.shuffling : role == .repeat ? track.repeating : false
+        if role == .time {
+            state.elapsed = Int(track.position)
+            state.duration = track.duration
+        }
+        return state
+    }
+
+    /// Sends `png` to a title or control key and remembers it under `key`.
+    func sendRole(device: String, slot: String, key: String, png: Data) {
+        roleFaces[device + "\n" + slot] = (key, png)
+        sendImage(png, device: device, slot: slot)
+    }
+
+    /// True when the key already shows `key`; with `force` it is sent again.
+    func roleUnchanged(device: String, slot: String, key: String, force: Bool) -> Bool {
+        guard let last = roleFaces[device + "\n" + slot], last.key == key else { return false }
+        if force { sendImage(last.png, device: device, slot: slot) }
+        return true
+    }
+
+    /// Brings every title and control key in line with `display`, rendering
+    /// and sending only the keys whose face changed (every key when `force`).
+    /// Static control faces are cached like tiles; the time and banner frames
+    /// are not.
+    func updateRoles(_ display: Display, force: Bool, now: Date) {
+        roleDisplay = display
+        var scrolling = false
+        for control in controls {
+            guard let palette = palette(display, size: control.size, now: now) else { return }
+            let state = controlState(control.role, display)
+            let gap = mosaicGap(size: control.size)
+            let key = "\(state.key)\n\(palette.key)\n\(control.index)"
+            if roleUnchanged(device: control.device, slot: control.slot, key: key, force: force) { continue }
+            let cached = control.role == .time ? nil : cache.controlPath(key, size: control.size)
+            var png = cached.flatMap { cache.load($0) }
+            if png == nil {
+                guard let background = pageCrop(palette.canvas, index: control.index, size: control.size, gap: gap),
+                      let image = renderControl(state, background: background, accent: palette.accent, size: control.size),
+                      let data = pngData(image) else {
+                    failed("rendering the \(control.role.rawValue) key", now: now)
+                    return
+                }
+                png = data
+                if let cached {
+                    if !cache.store(data, at: cached) { log("error writing cache file \(cached)") }
+                    let removed = cache.prune()
+                    if removed > 0 { log("cache pruned \(removed) old tiles") }
+                }
+            }
+            if let png { sendRole(device: control.device, slot: control.slot, key: key, png: png) }
+        }
+        for banner in banners {
+            guard let palette = palette(display, size: banner.size, now: now) else { return }
+            var title = "Nothing playing"
+            var artist = ""
+            var playing = false
+            if case .track(let track) = display {
+                title = cleaned(track.title).isEmpty ? "Unknown track" : cleaned(track.title)
+                artist = cleaned(track.artist)
+                playing = track.playing
+            }
+            let gap = mosaicGap(size: banner.size)
+            let k = CGFloat(banner.size) / 118
+            let available = CGFloat(banner.count * banner.size + (banner.count - 1) * gap) - 24 * k
+            let distance = fitTitle(title, width: available, k: k).width - available
+            var offset: CGFloat?
+            if distance > 0 && playing && settings.bannerFps > 0 {
+                let start = scrollStarts[banner].flatMap { $0.title == title ? $0.at : nil } ?? now
+                scrollStarts[banner] = (title, start)
+                offset = scrollOffset(elapsed: now.timeIntervalSince(start), distance: distance, speed: scrollSpeed * k).rounded()
+                scrolling = true
+            }
+            let key = "\(title)\n\(artist)\n\(palette.key)\n\(offset.map { "\($0)" } ?? "still")\n\(banner.first) \(banner.count)"
+            let unchanged = banner.slots.enumerated().map { i, slot in
+                roleFaces[banner.device + "\n" + slot]?.key == "\(key)\n\(i)"
+            }
+            if !unchanged.contains(false) {
+                for slot in banner.slots where force {
+                    if let last = roleFaces[banner.device + "\n" + slot] { sendImage(last.png, device: banner.device, slot: slot) }
+                }
+                continue
+            }
+            guard let background = pageCrop(palette.canvas, index: banner.first, count: banner.count, size: banner.size, gap: gap),
+                  let canvas = renderBanner(title: title, artist: artist, background: background, size: banner.size, offset: offset)
+            else {
+                failed("rendering the title banner", now: now)
+                return
+            }
+            for (i, slot) in banner.slots.enumerated() {
+                let rect = CGRect(x: i * (banner.size + gap), y: 0, width: banner.size, height: banner.size)
+                guard let tile = canvas.cropping(to: rect), let png = pngData(tile) else {
+                    failed("rendering the title banner", now: now)
+                    return
+                }
+                // A key whose part of the banner did not change is not sent.
+                if !force, roleFaces[banner.device + "\n" + slot]?.png == png {
+                    roleFaces[banner.device + "\n" + slot] = ("\(key)\n\(i)", png)
+                    continue
+                }
+                sendRole(device: banner.device, slot: slot, key: "\(key)\n\(i)", png: png)
+            }
+        }
+        setBannerTimer(scrolling)
+    }
+
+    /// Redraws the banners `banner_fps` times a second while one scrolls.
+    func setBannerTimer(_ on: Bool) {
+        if on, bannerTimer == nil {
+            let timer = Timer(timeInterval: 1 / settings.bannerFps, repeats: true) { [unowned self] _ in
+                guard let display = self.roleDisplay else { return }
+                self.updateRoles(display, force: false, now: Date())
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            bannerTimer = timer
+        } else if !on {
+            bannerTimer?.invalidate()
+            bannerTimer = nil
         }
     }
 }
@@ -1496,12 +2243,18 @@ struct PreviewConfig {
     var paused = false
     var appIcon = false
     var size = defaultSize
+    var role: Role?
+    var slot = "gridMiddle"
+    var on = false
+    var position = 0.0
+    var duration = 0.0
 }
 
 let usage = """
 usage: spotify-module
        spotify-module --preview OUT.png [--title T --artist A
                       [--artwork FILE_OR_URL] [--paused] | --app-icon] [--size PIXELS]
+                      [--role ROLE [--slot SLOT] [--on] [--position S] [--duration S]]
 
   With no arguments it runs as an OpenLogi key module, speaking the module
   protocol on stdin and stdout; OpenLogi starts it that way.
@@ -1509,6 +2262,10 @@ usage: spotify-module
   --preview  render one tile to OUT.png and exit; touches neither Spotify
              nor OpenLogi. With --app-icon it renders the Spotify-not-running
              tile; without --title or --app-icon, the generic stand-in.
+  --role     render a control key instead (shuffle, repeat, time, previous,
+             next) as it looks at grid SLOT (default gridMiddle) of a control
+             page, or with title the banner across the top row. Without
+             --title or --artwork it is drawn as with nothing loaded.
 """
 
 func runPreview(_ args: [String]) -> Never {
@@ -1528,6 +2285,16 @@ func runPreview(_ args: [String]) -> Never {
         case "--artwork": config.artwork = value(flag)
         case "--paused": config.paused = true
         case "--app-icon": config.appIcon = true
+        case "--role":
+            guard let role = Role(rawValue: value(flag)), role != .art else { die("--role must be a control role\n\(usage)") }
+            config.role = role
+        case "--slot":
+            config.slot = value(flag)
+            guard gridSlots.contains(config.slot) else { die("--slot must be a grid slot such as gridMiddle") }
+        case "--on": config.on = true
+        case "--position", "--duration":
+            guard let seconds = Double(value(flag)), seconds >= 0 else { die("\(flag) must be a number of seconds") }
+            if flag == "--position" { config.position = seconds } else { config.duration = seconds }
         case "--size":
             guard let pixels = Int(value(flag)), sizeRange.contains(pixels) else {
                 die("--size must be a whole number of pixels from \(sizeRange.lowerBound) to \(sizeRange.upperBound)")
@@ -1542,13 +2309,33 @@ func runPreview(_ args: [String]) -> Never {
         index += 1
     }
     guard let output = config.output else { die("--preview OUT.png is required\n\(usage)") }
+    var art: CGImage?
+    if let location = config.artwork {
+        art = loadArtwork(location, maxPixels: config.size * 3)
+        if art == nil { log("artwork could not be loaded, using plain tile: \(location)") }
+    }
     let image: CGImage?
-    if let title = config.title {
-        var art: CGImage?
-        if let location = config.artwork {
-            art = loadArtwork(location, maxPixels: config.size * 3)
-            if art == nil { log("artwork could not be loaded, using plain tile: \(location)") }
+    if let role = config.role {
+        let loaded = config.title != nil || config.artwork != nil
+        let gap = Int((Double(config.size) * defaultGapPercent / 100).rounded())
+        let seed = loaded ? (config.title ?? "") + "\n" + (config.artist ?? "") : nil
+        let index = role == .title ? 0 : gridSlots.firstIndex(of: config.slot)!
+        guard let palette = renderControlBackground(art: art, seed: seed, paused: config.paused && loaded,
+                                                    side: 3 * config.size + 2 * gap),
+              let background = pageCrop(palette.canvas, index: index, count: role == .title ? 3 : 1, size: config.size, gap: gap)
+        else { die("could not render the control background") }
+        if role == .title {
+            image = renderBanner(title: loaded ? config.title ?? "Unknown track" : "Nothing playing",
+                                 artist: config.artist ?? "", background: background, size: config.size, offset: nil)
+        } else {
+            var state = ControlState(role: role)
+            state.enabled = loaded
+            state.on = config.on
+            state.elapsed = Int(config.position)
+            state.duration = config.duration
+            image = renderControl(state, background: background, accent: palette.accent, size: config.size)
         }
+    } else if let title = config.title {
         image = renderTile(Tile(title: title, artist: config.artist ?? "", art: art, paused: config.paused),
                            size: config.size)
     } else if config.appIcon, let icon = renderAppIconTile(size: config.size) {

@@ -10,6 +10,7 @@ import json
 import os
 import shutil
 import struct
+import subprocess
 import tempfile
 import time
 import unittest
@@ -89,6 +90,8 @@ def read_png(data):
 
 GRID = ["gridTopLeft", "gridTopMiddle", "gridTopRight", "gridMiddleLeft", "gridMiddle",
         "gridMiddleRight", "gridBottomLeft", "gridBottomMiddle", "gridBottomRight"]
+PAGE2_ROLES = dict(zip(["page2:" + name for name in GRID],
+                       ["title", "title", "title", "shuffle", "time", "repeat", "previous", "art", "next"]))
 
 
 class ModuleTest(unittest.TestCase):
@@ -583,6 +586,180 @@ class ModuleTest(unittest.TestCase):
         host = self.start(settings={"mosaic_gap_percent": 12.5, "mosaic_stagger_ms": 0})
         got = host.drain(0.8)
         self.assertEqual([m for m in got if m["type"] == "log" and m["level"] == "warn"], [])
+
+    # Per-key roles
+
+    def control_page(self, **settings):
+        return dict(settings, keys=PAGE2_ROLES)
+
+    def by_slot(self, messages):
+        return {m["slot"]: m for m in messages}
+
+    def preview(self, *args):
+        out = os.path.join(self.dir, "preview.png")
+        env = dict(os.environ, FAKE_SPOTIFY_DIR=self.dir)
+        result = subprocess.run([BINARY, "--preview", out, *args], capture_output=True, text=True, timeout=30, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with open(out, "rb") as f:
+            return f.read()
+
+    def role_images(self, slot, seconds):
+        return [m for m in self.host.drain(seconds) if m["type"] == "image" and m["slot"] == slot]
+
+    def test_roles_draw_each_key_while_page1_stays_a_mosaic(self):
+        self.playing(artwork=self.position_art())
+        host = self.start(settings=self.control_page())
+        host.keys([self.slot()])
+        full = self.image()
+        host.keys(self.page() + self.page("page2:"))
+        got = self.keyed_images(18)
+        self.assert_cut(self.mosaic(got), 118, 25)
+        page2 = {m["slot"]: m for m in got if m["slot"].startswith("page2:")}
+        self.assertEqual(sorted(page2), sorted(PAGE2_ROLES))
+        self.assertEqual(len({m["png"] for m in page2.values()}), 9, "control faces are not distinct")
+        self.assertEqual(page2["page2:gridBottomMiddle"]["png"], full["png"])
+        mosaic_tiles = {m["png"] for m in got if not m["slot"].startswith("page2:")}
+        self.assertFalse(mosaic_tiles & {m["png"] for m in page2.values()})
+        self.assertEqual([m for m in host.drain(0.5) if m["type"] == "image_all"], [])
+
+    def test_title_banner_runs_across_three_keys(self):
+        self.playing(name="Golden Hour Drive", artist="The Night Lanterns", artwork=self.position_art())
+        keys = {"page2:" + name: "title" for name in GRID[:3]}
+        host = self.start(settings={"keys": keys})
+        host.keys(self.page("page2:"))
+        tiles = {m["slot"][6:]: m for m in self.keyed_images(9)}
+        size, gap = 118, 30
+        side = 3 * size + 2 * gap
+        # The blurred, darkened cover: red still follows the canvas x, at 60%.
+        for col, px in ((0, 90), (1, 6), (1, 60), (2, 6)):
+            _, _, pixel = read_png(tiles[GRID[col]]["_bytes"])
+            x = col * (size + gap) + px + 0.5
+            self.assertAlmostEqual(pixel(px, 4)[0] * side / (0.6 * 255), x, delta=8, msg=f"key {col} at {px}")
+        # The title runs from the first key into the second.
+        for name in GRID[:2]:
+            width, height, pixel = read_png(tiles[name]["_bytes"])
+            white = sum(1 for y in range(20, 70) for x in range(width) if min(pixel(x, y)[:3]) >= 235)
+            self.assertGreater(white, 20, f"no title on {name}")
+
+    def scroll_title(self):
+        # 443 px at the smallest size, 53 more than the banner holds.
+        return "Golden Hour Drive Through The Long Night Again"
+
+    def test_a_long_title_scrolls_and_rests_at_both_ends(self):
+        self.playing(name=self.scroll_title(), artwork=self.position_art())
+        keys = {"page2:" + name: "title" for name in GRID[:3]}
+        host = self.start(settings={"keys": keys, "banner_fps": 8})
+        host.keys(self.page("page2:"))
+        frames = self.role_images("page2:gridTopLeft", 9)
+        self.assertGreater(len(frames), 4, [round(f["_at"], 2) for f in frames])
+        times = [f["_at"] for f in frames]
+        self.assertGreater(times[1] - times[0], 1.7, "no rest at the start")
+        moving = [b - a for a, b in zip(times[1:], times[2:])]
+        rest = next(i for i, d in enumerate(moving) if d > 1.0)
+        self.assertGreater(rest, 2, "it hardly moved")
+        self.assertTrue(all(d < 0.5 for d in moving[:rest]), moving)
+        self.assertGreater(moving[rest], 1.7, "no rest at the end")
+        run = [f["png"] for f in frames[:rest + 2]]
+        self.assertTrue(all(a != b for a, b in zip(run, run[1:])), "consecutive frames repeat")
+        self.assertEqual(frames[rest + 2]["png"], frames[0]["png"], "it did not jump back to the start")
+
+    def test_banner_fps_0_does_not_scroll(self):
+        self.playing(name=self.scroll_title(), artwork=self.position_art())
+        keys = {"page2:" + name: "title" for name in GRID[:3]}
+        host = self.start(settings={"keys": keys, "banner_fps": 0})
+        host.keys(self.page("page2:"))
+        self.assertEqual(len(self.role_images("page2:gridTopLeft", 3.5)), 1)
+
+    def test_shuffle_and_repeat_presses_toggle_and_redraw_only_that_key(self):
+        self.playing(state="paused", artwork=self.position_art(), position=40, duration=200000)
+        host = self.start(settings=self.control_page())
+        host.keys(self.page("page2:"))
+        first = self.by_slot(self.keyed_images(9))
+        for slot, field in (("page2:gridMiddleLeft", "shuffling"), ("page2:gridMiddleRight", "repeating")):
+            host.press(device="keypad-1", slot=slot)
+            got = [m for m in host.drain(1.2) if m["type"] == "image"]
+            self.assertEqual([m["slot"] for m in got], [slot])
+            self.assertNotEqual(got[0]["png"], first[slot]["png"])
+            with open(os.path.join(self.dir, "state.json")) as f:
+                self.assertTrue(json.load(f)[field])
+        self.assertNotIn("playpause", self.calls())
+
+    def test_time_key_shows_the_time_advances_and_seeks_back(self):
+        self.playing(state="paused", artwork=self.position_art(), position=102, duration=236000)
+        host = self.start(settings=self.control_page())
+        host.keys(self.page("page2:"))
+        time_key = self.by_slot(self.keyed_images(9))["page2:gridMiddle"]
+        common = ["--role", "time", "--duration", "236", "--artwork", self.position_art()]
+        self.assertEqual(time_key["_bytes"], self.preview(*common, "--position", "102", "--paused"))
+
+        playing = {self.preview(*common, "--position", str(p)): p for p in range(102, 108)}
+        self.playing(artwork=self.position_art(), position=102, duration=236000)
+        ticks = self.role_images("page2:gridMiddle", 3.3)
+        seconds = [playing.get(t["_bytes"]) for t in ticks]
+        self.assertNotIn(None, seconds, "a tick drew something other than the time")
+        self.assertGreaterEqual(len(seconds), 3, seconds)
+        self.assertEqual(seconds, sorted(set(seconds)), "the ring did not advance")
+
+        host.press(device="keypad-1", slot="page2:gridMiddle")
+        redrawn = self.role_images("page2:gridMiddle", 0.6)
+        with open(os.path.join(self.dir, "state.json")) as f:
+            position = json.load(f)["position"]
+        self.assertTrue(85 < position < seconds[-1] - 13, position)
+        self.assertTrue(redrawn, "the time key was not redrawn at once")
+        self.assertIn("seek-back", self.calls())
+
+        self.playing(state="paused", artwork=self.position_art(), position=5, duration=236000)
+        self.role_images("page2:gridMiddle", 0.6)
+        host.press(device="keypad-1", slot="page2:gridMiddle")
+        redrawn = self.role_images("page2:gridMiddle", 0.8)
+        with open(os.path.join(self.dir, "state.json")) as f:
+            self.assertEqual(json.load(f)["position"], 0)
+        self.assertEqual(redrawn[-1]["_bytes"], self.preview(*common, "--position", "0", "--paused"))
+
+    def test_previous_and_next_presses_reach_spotify(self):
+        self.playing(state="paused", artwork=self.position_art())
+        host = self.start(settings=self.control_page())
+        host.keys(self.page("page2:"))
+        self.keyed_images(9)
+        host.press(device="keypad-1", slot="page2:gridBottomLeft")
+        host.press(device="keypad-1", slot="page2:gridBottomRight")
+        host.drain(0.5)
+        calls = self.calls()
+        self.assertEqual(calls.count("previous-track"), 1)
+        self.assertEqual(calls.count("next-track"), 1)
+        self.assertNotIn("playpause", calls)
+
+    def test_control_presses_do_nothing_when_spotify_is_not_running(self):
+        self.set_state(running=False)
+        host = self.start(settings=self.control_page())
+        host.keys(self.page("page2:"))
+        self.keyed_images(9)
+        for slot, role in PAGE2_ROLES.items():
+            if role not in ("title", "art"):
+                host.press(device="keypad-1", slot=slot)
+        host.drain(0.8)
+        self.assertEqual([c for c in self.calls() if c != "read"], [])
+
+    def test_an_unknown_role_warns_once_and_draws_art(self):
+        self.playing(artwork=self.position_art())
+        host = self.start(settings={"keys": {"gridMiddle": "volume", "gridTopLeft": 7, "gridBottomLeft": "next"}})
+        warnings = [m for m in host.drain(0.6) if m["type"] == "log" and m["level"] == "warn"]
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("keys gridMiddle = volume is not a role; using art", warnings[0]["message"])
+        self.assertIn("keys gridTopLeft = 7 is not a role; using art", warnings[0]["message"])
+        host.keys([self.slot(), self.slot(name="gridTopLeft"), self.slot(name="gridBottomLeft")])
+        got = self.by_slot(self.keyed_images(3))
+        self.assertEqual(got["gridMiddle"]["png"], got["gridTopLeft"]["png"])
+        self.assertNotEqual(got["gridBottomLeft"]["png"], got["gridMiddle"]["png"])
+
+    def test_the_tick_sends_only_the_time_key(self):
+        self.playing(artwork=self.position_art(), position=30, duration=200000)
+        host = self.start(settings=self.control_page())
+        host.keys(self.page("page2:"))
+        self.keyed_images(9)
+        got = [m for m in host.drain(3.2) if m["type"] in ("image", "image_all")]
+        self.assertGreaterEqual(len(got), 2)
+        self.assertEqual({m["slot"] for m in got}, {"page2:gridMiddle"})
 
 
 class SelfTest(unittest.TestCase):

@@ -117,6 +117,62 @@ Use your keypad's own device key. On a later page, name the keys
 its default, one out of range is clamped, and either puts one warning in
 OpenLogi's log. Changing the settings restarts the module.
 
+## Per-key roles
+
+A page can also be a small Spotify remote: give its keys roles in the
+module's settings. A page with any role other than `art` is never a mosaic;
+its keys share one background (the cover blurred and darkened, so the
+controls take the album's colors) and an accent color picked from the cover.
+
+| Role | Shows | A press |
+| --- | --- | --- |
+| `art` | The full tile, as on any other key. The default for every key. | Plays or pauses. |
+| `title` | The title over the artist. Side by side `title` keys in one row make one banner across them, with the same gap handling as a mosaic. | Plays or pauses. |
+| `shuffle` | Shuffle arrows; in the accent color with an underline when on. | Turns shuffle on or off. |
+| `repeat` | The repeat loop, on or off like shuffle. | Turns repeat on or off. |
+| `time` | The time into the track, with a ring that fills as it plays, updated every second. | Jumps back 15 seconds. |
+| `previous` | Skip back. | Previous track. |
+| `next` | Skip forward. | Next track. |
+
+For example, page 2 of a Spotify profile: a title banner over shuffle, time,
+and repeat, over previous, art, and next:
+
+```toml
+[modules."com.typ.openlogi.spotify".settings.keys]
+"page2:gridTopLeft" = "title"
+"page2:gridTopMiddle" = "title"
+"page2:gridTopRight" = "title"
+"page2:gridMiddleLeft" = "shuffle"
+"page2:gridMiddle" = "time"
+"page2:gridMiddleRight" = "repeat"
+"page2:gridBottomLeft" = "previous"
+"page2:gridBottomMiddle" = "art"
+"page2:gridBottomRight" = "next"
+```
+
+Bind those nine keys to Spotify Now Playing as well, as in the mosaic sample
+above. A title too long for its banner first shrinks, then scrolls: still for
+2 seconds, across, still for 2 seconds, and back. `banner_fps` (default `3`,
+0 to 8) sets how many frames a second it moves; `0` turns scrolling off and
+ends a long title in an ellipsis. Titles do not scroll while paused.
+
+- **Repeat is on or off only.** Spotify's Mac scripting has no repeat-one
+  setting, so the key cannot show or choose it.
+- **Slot names are shared across profiles.** A role belongs to a slot name
+  such as `page2:gridMiddle`, on every keypad and in every profile that binds
+  that key to this module. Map roles on a page only the Spotify profile uses
+  (page 2 here), so another profile's key on that slot is not turned into a
+  control.
+- With Spotify not running or nothing loaded, the control keys go dim and
+  their presses do nothing; the title says Nothing playing and the art key
+  shows the app icon.
+- A role that is not one of these, or is not text, counts as `art` and puts
+  one warning in OpenLogi's log.
+
+While a shuffle, repeat, or time key is bound and a track is loaded, the
+module reads Spotify once a second, so a change made in the Spotify app
+shows within about a second. Only keys whose picture changed are sent.
+
 ## The Automation prompt
 
 The module reads Spotify and plays or pauses it through AppleScript, so the
@@ -160,7 +216,8 @@ Rebuilding the module can make macOS ask again.
   track, playing or paused, and size, named by a SHA-256 of those plus a
   design version, plus one each for the app icon tile and its stand-in, and
   one per key of a mosaic (track, art, playing or paused, size, gap, and
-  position). A tile seen before is sent straight from the cache. Past 300 tiles the least
+  position), and one per control face (everything it shows). The time key
+  and scrolling banner frames are never cached. A tile seen before is sent straight from the cache. Past 300 tiles the least
   recently used are deleted down to 250. Delete the folder any time, for
   example after Spotify changes its icon.
 - **Timeouts.** Spotify reads time out after 5 seconds, album art downloads
@@ -181,6 +238,8 @@ Render one tile to a PNG without Spotify or OpenLogi:
     --artwork ~/Pictures/cover.jpg [--paused] [--size 118]
 ./spotify-module --preview out.png --app-icon     # the Spotify-not-running tile
 ./spotify-module --preview out.png                # its stand-in
+./spotify-module --preview out.png --role time --position 102 --duration 236 \
+    --artwork ~/Pictures/cover.jpg                # a control key (any role but art)
 ```
 
 Try the module without OpenLogi: `tools/fake_host.py` starts it, sends

@@ -5,7 +5,10 @@
 // State lives in $FAKE_SPOTIFY_DIR/state.json, which tests edit:
 //   {"installed": true, "running": true, "state": "playing" | "paused" | "stopped",
 //    "id": "...", "name": "...", "artist": "...", "artwork": "/path/or/url",
-//    "plays_needed": 3, "read_error": "message"}
+//    "plays_needed": 3, "read_error": "message",
+//    "shuffling": false, "repeating": false, "position": 12.5, "duration": 200000}
+// `position` is in seconds and advances with the clock from the file's last
+// write while playing; `duration` is in milliseconds, as Spotify reports it.
 // Every call is appended to $FAKE_SPOTIFY_DIR/calls.log, one word per line.
 // A change to state.json stands in for Spotify's playback notification.
 
@@ -75,7 +78,15 @@ final class FakeSpotify: SpotifyBackend {
 
     func isRunning() -> Bool { load()["running"] as? Bool ?? false }
 
-    func read() -> SpotifyState {
+    /// The position now: the stored one, plus the time since the file was
+    /// written while playing.
+    private func position(_ state: [String: Any]) -> Double {
+        let stored = (state["position"] as? NSNumber)?.doubleValue ?? 0
+        guard state["state"] as? String == "playing", let written = modified() else { return stored }
+        return stored + max(0, Date().timeIntervalSince(written))
+    }
+
+    func read(extended: Bool) -> SpotifyState {
         record("read")
         let state = load()
         guard state["running"] as? Bool ?? false else { return .notRunning }
@@ -83,15 +94,37 @@ final class FakeSpotify: SpotifyBackend {
         let player = state["state"] as? String ?? "stopped"
         let id = state["id"] as? String ?? ""
         guard player != "stopped", !id.isEmpty else { return .idle }
-        return .track(Track(id: id, title: state["name"] as? String ?? "", artist: state["artist"] as? String ?? "",
-                            artworkURL: state["artwork"] as? String ?? "", playing: player == "playing"))
+        var track = Track(id: id, title: state["name"] as? String ?? "", artist: state["artist"] as? String ?? "",
+                          artworkURL: state["artwork"] as? String ?? "", playing: player == "playing")
+        if extended {
+            track.shuffling = state["shuffling"] as? Bool ?? false
+            track.repeating = state["repeating"] as? Bool ?? false
+            track.position = position(state)
+            track.duration = ((state["duration"] as? NSNumber)?.doubleValue ?? 0) / 1000
+        }
+        return .track(track)
     }
 
     func playPause() -> CommandOutcome {
         record("playpause")
         var state = load()
         guard state["running"] as? Bool ?? false else { return .notRunning }
+        state["position"] = position(state)
         state["state"] = (state["state"] as? String) == "playing" ? "paused" : "playing"
+        save(state)
+        return .done
+    }
+
+    func command(_ command: PlayerCommand) -> CommandOutcome {
+        record(command.rawValue.replacingOccurrences(of: " ", with: "-"))
+        var state = load()
+        guard state["running"] as? Bool ?? false else { return .notRunning }
+        switch command {
+        case .toggleShuffle: state["shuffling"] = !(state["shuffling"] as? Bool ?? false)
+        case .toggleRepeat: state["repeating"] = !(state["repeating"] as? Bool ?? false)
+        case .seekBack: state["position"] = max(0, position(state) - 15)
+        case .previous, .next: return .done
+        }
         save(state)
         return .done
     }
