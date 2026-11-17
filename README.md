@@ -54,7 +54,7 @@ instead.
    Playing**. OpenLogi starts the module while it is ticked.
 2. In the keypad's bindings, choose **Spotify Now Playing** as the action for
    any key, on any page. Bind it to more than one key if you like; they all
-   show the same tile.
+   show the same tile, unless all nine keys of a page are bound (see below).
 
 The same settings in `config.toml` (use your keypad's own device key):
 
@@ -66,7 +66,56 @@ enabled = true
 gridMiddle = { Module = "com.typ.openlogi.spotify" }
 ```
 
-The module has no settings of its own.
+## Album art across all nine keys
+
+Bind all nine keys of one page to Spotify Now Playing (for example on a
+per-app profile for Spotify, so the keypad turns into the album cover while
+Spotify is in front) and the art spreads across the whole grid, one piece per
+key:
+
+- **Playing:** the art only, no title or artist.
+- **Paused:** the whole picture in grayscale and dimmed, with the play button
+  on the center key.
+- **Spotify not running, or nothing loaded:** the app icon tile on the center
+  key; the other eight keys go black.
+- **New track:** the new art fills in one key at a time, top left to bottom
+  right. Play and pause, and switching to the page, redraw all nine at once.
+
+Any of the nine keys plays or pauses, as a single key does. A page with fewer
+than nine keys bound keeps one full tile per key.
+
+The art covers the keys and the gaps between them, so a straight line in the
+cover stays straight from key to key; the strips under the gaps are not shown.
+Two optional settings tune it:
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `mosaic_gap_percent` | `25` | The gap between keys as a percentage of a key's side (0 to 60). Raise it if lines look broken at the gaps, lower it if they look stretched. 0 cuts the art with no gaps. |
+| `mosaic_stagger_ms` | `90` | Milliseconds between keys when a new track fills in (0 to 1000). 0 draws all nine at once. |
+
+A Spotify profile with all nine keys on page 1, in `config.toml`:
+
+```toml
+[devices."serial:YOUR-KEYPAD-SERIAL".per_app_bindings."com.spotify.client"]
+gridTopLeft = { Module = "com.typ.openlogi.spotify" }
+gridTopMiddle = { Module = "com.typ.openlogi.spotify" }
+gridTopRight = { Module = "com.typ.openlogi.spotify" }
+gridMiddleLeft = { Module = "com.typ.openlogi.spotify" }
+gridMiddle = { Module = "com.typ.openlogi.spotify" }
+gridMiddleRight = { Module = "com.typ.openlogi.spotify" }
+gridBottomLeft = { Module = "com.typ.openlogi.spotify" }
+gridBottomMiddle = { Module = "com.typ.openlogi.spotify" }
+gridBottomRight = { Module = "com.typ.openlogi.spotify" }
+
+[modules."com.typ.openlogi.spotify".settings]
+mosaic_gap_percent = 25
+mosaic_stagger_ms = 90
+```
+
+Use your keypad's own device key. On a later page, name the keys
+`"page2:gridTopLeft"` and so on. A setting that is not a number falls back to
+its default, one out of range is clamped, and either puts one warning in
+OpenLogi's log. Changing the settings restarts the module.
 
 ## The Automation prompt
 
@@ -109,8 +158,9 @@ Rebuilding the module can make macOS ask again.
   (118 pixels on the MX Creative Keypad).
 - **Render cache.** `~/Library/Caches/com.typ.openlogi.spotify/`, one PNG per
   track, playing or paused, and size, named by a SHA-256 of those plus a
-  design version, plus one each for the app icon tile and its stand-in. A tile
-  seen before is sent straight from the cache. Past 300 tiles the least
+  design version, plus one each for the app icon tile and its stand-in, and
+  one per key of a mosaic (track, art, playing or paused, size, gap, and
+  position). A tile seen before is sent straight from the cache. Past 300 tiles the least
   recently used are deleted down to 250. Delete the folder any time, for
   example after Spotify changes its icon.
 - **Timeouts.** Spotify reads time out after 5 seconds, album art downloads

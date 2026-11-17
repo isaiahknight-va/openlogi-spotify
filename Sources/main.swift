@@ -52,6 +52,16 @@ let cachePruneTarget = 250
 // Part of every cache key: bump it when the tile design changes so old
 // renders are not reused.
 let renderVersion = "tile-v3"
+let mosaicVersion = "mosaic-v1"
+// A page's nine grid keys in reading order; all nine bound on one page and
+// one device make a mosaic.
+let gridSlots = ["gridTopLeft", "gridTopMiddle", "gridTopRight", "gridMiddleLeft", "gridMiddle",
+                 "gridMiddleRight", "gridBottomLeft", "gridBottomMiddle", "gridBottomRight"]
+let centerIndex = 4
+let defaultGapPercent: Double = 25
+let gapPercentRange: ClosedRange<Double> = 0...60
+let defaultStaggerMs: Double = 90
+let staggerMsRange: ClosedRange<Double> = 0...1000
 
 // MARK: - Artwork
 
@@ -291,6 +301,59 @@ func renderTile(_ tile: Tile, size: Int) -> CGImage? {
         context.fillEllipse(in: CGRect(x: center.x - radius, y: center.y - radius, width: 2 * radius, height: 2 * radius))
         drawPlayTriangle(center: center, height: 16 * k, context: context)
     }
+    return context.makeImage()
+}
+
+/// The art across the nine keys of a page, in reading order. The art covers a
+/// canvas of three keys plus the two gaps between them, and each key shows its
+/// own square of it, so the art under the gaps is skipped and lines stay
+/// straight across keys. Paused: grayscale and dimmed like a tile, with the
+/// play button on the center key only.
+func renderMosaic(_ art: CGImage, paused: Bool, size: Int, gap: Int) -> [CGImage]? {
+    let side = 3 * size + 2 * gap
+    guard let context = CGContext(
+        data: nil, width: side, height: side, bitsPerComponent: 8, bytesPerRow: 0,
+        space: sRGB, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+    ) else { return nil }
+    context.interpolationQuality = .high
+    let s = CGFloat(side)
+    let k = CGFloat(size) / 118
+    let full = CGRect(x: 0, y: 0, width: s, height: s)
+    if paused, let gray = grayscale(art, size: side) {
+        context.draw(gray, in: full)
+    } else {
+        drawAspectFill(art, in: full, context: context)
+    }
+    if paused {
+        context.setFillColor(black(0.42))
+        context.fill(full)
+        // The center key's center is the canvas's center.
+        let center = CGPoint(x: s / 2, y: s / 2)
+        let radius = 16 * k
+        context.setFillColor(black(0.55))
+        context.fillEllipse(in: CGRect(x: center.x - radius, y: center.y - radius, width: 2 * radius, height: 2 * radius))
+        drawPlayTriangle(center: center, height: 16 * k, context: context)
+    }
+    guard let canvas = context.makeImage() else { return nil }
+    var tiles: [CGImage] = []
+    for row in 0..<3 {
+        for col in 0..<3 {
+            // CGImage cropping counts from the top left.
+            let rect = CGRect(x: col * (size + gap), y: row * (size + gap), width: size, height: size)
+            guard let tile = canvas.cropping(to: rect) else { return nil }
+            tiles.append(tile)
+        }
+    }
+    return tiles
+}
+
+func renderBlackTile(size: Int) -> CGImage? {
+    guard let context = CGContext(
+        data: nil, width: size, height: size, bitsPerComponent: 8, bytesPerRow: 0,
+        space: sRGB, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+    ) else { return nil }
+    context.setFillColor(black(1))
+    context.fill(CGRect(x: 0, y: 0, width: size, height: size))
     return context.makeImage()
 }
 
@@ -629,6 +692,13 @@ final class RenderCache {
         path(for: "generic", size: size)
     }
 
+    /// One key of a mosaic: track, art, playing or paused, gap, and position
+    /// (0 to 8 in reading order), plus the size.
+    func mosaicPath(for key: TrackKey, art: String, gap: Int, position: Int, size: Int) -> String {
+        path(for: "\(mosaicVersion)\n\(key.id)\n\(art)\n\(key.playing ? "playing" : "paused")\n\(gap)\n\(position)",
+             size: size)
+    }
+
     private func path(for name: String, size: Int) -> String {
         let tuple = "\(renderVersion)\n\(name)\n\(size)"
         let hex = SHA256.hash(data: Data(tuple.utf8)).map { String(format: "%02x", $0) }.joined()
@@ -759,6 +829,76 @@ struct Slot: Equatable {
     var size: Int
 }
 
+/// All nine grid keys of one page on one device: drawn as one picture.
+struct MosaicGroup: Hashable {
+    var device: String
+    var page: String        // "" on page 1, "page2:" and so on after
+    var size: Int           // the center key's
+
+    var slots: [String] { gridSlots.map { page + $0 } }
+}
+
+/// Splits the bound keys into full pages (mosaics) and the rest, which keep
+/// one full tile each. Mosaics come in the order their pages first appear.
+func groupSlots(_ slots: [Slot]) -> (mosaics: [MosaicGroup], singles: [Slot]) {
+    var pages: [String: [String: Slot]] = [:]
+    var order: [(device: String, page: String)] = []
+    for slot in slots {
+        let colon = slot.slot.firstIndex(of: ":")
+        let page = colon.map { String(slot.slot[...$0]) } ?? ""
+        let name = colon.map { String(slot.slot[slot.slot.index(after: $0)...]) } ?? slot.slot
+        guard gridSlots.contains(name) else { continue }
+        let id = slot.device + "\n" + page
+        if pages[id] == nil { order.append((slot.device, page)) }
+        pages[id, default: [:]][name] = slot
+    }
+    var mosaics: [MosaicGroup] = []
+    var taken: Set<String> = []
+    for (device, page) in order {
+        let keys = pages[device + "\n" + page] ?? [:]
+        guard keys.count == gridSlots.count, let center = keys[gridSlots[centerIndex]] else { continue }
+        mosaics.append(MosaicGroup(device: device, page: page, size: center.size))
+        for name in gridSlots { taken.insert(device + "\n" + page + name) }
+    }
+    return (mosaics, slots.filter { !taken.contains($0.device + "\n" + $0.slot) })
+}
+
+struct Settings {
+    var gapPercent = defaultGapPercent
+    var staggerMs = defaultStaggerMs
+}
+
+/// The `settings` table from `hello`. A missing key takes its default; a
+/// value that is not a number takes the default and one out of range is
+/// clamped. Each problem, and each unknown key, is listed in `problems`.
+func parseSettings(_ value: Any?) -> (settings: Settings, problems: [String]) {
+    var settings = Settings()
+    var problems: [String] = []
+    guard let value, !(value is NSNull) else { return (settings, problems) }
+    guard let table = value as? [String: Any] else {
+        return (settings, ["settings is not a table; using the defaults"])
+    }
+    func number(_ key: String, _ range: ClosedRange<Double>, _ fallback: Double) -> Double {
+        guard let raw = table[key] else { return fallback }
+        // JSON true and false arrive as NSNumber too.
+        guard let n = raw as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID(), n.doubleValue.isFinite else {
+            problems.append("\(key) \(raw) is not a number; using \(Int(fallback))")
+            return fallback
+        }
+        let clamped = min(max(n.doubleValue, range.lowerBound), range.upperBound)
+        if clamped != n.doubleValue {
+            problems.append("\(key) \(n) is outside \(Int(range.lowerBound)) to \(Int(range.upperBound)); using \(Int(clamped))")
+        }
+        return clamped
+    }
+    settings.gapPercent = number("mosaic_gap_percent", gapPercentRange, defaultGapPercent)
+    settings.staggerMs = number("mosaic_stagger_ms", staggerMsRange, defaultStaggerMs)
+    for key in table.keys.sorted() where key != "mosaic_gap_percent" && key != "mosaic_stagger_ms" {
+        problems.append("ignoring unknown setting \(key)")
+    }
+    return (settings, problems)
+}
+
 /// All Spotify reads, presses, and renders run on the main queue, which is
 /// serial, so they never overlap; NSAppleScript also wants the main thread.
 final class Controller {
@@ -768,12 +908,18 @@ final class Controller {
     let reconcileInterval: TimeInterval
 
     var slots: [Slot] = []
+    var mosaics: [MosaicGroup] = []
+    var singles: [Slot] = []
     var size = defaultSize
     var active: Bool { !slots.isEmpty }
+    var settings = Settings()
 
     var shown = Shown.unknown
+    var shownDisplay: Display?
     var shownPNG: Data?
+    var shownTiles: [MosaicGroup: [Data]] = [:]
     var shownIsFallback = false
+    var revealItems: [DispatchWorkItem] = []
     var failures = 0
     var nextAttemptAt = Date.distantPast
     var lastReadError: String?
@@ -782,6 +928,7 @@ final class Controller {
 
     var artURL: String?
     var artImage: CGImage?
+    var artPixels = 0
     var artFailedURL: String?
     var artFailedAt = Date.distantPast
 
@@ -806,6 +953,10 @@ final class Controller {
             output.report("warn", "host speaks protocol \(version); this module speaks \(protocolVersion)")
         }
         log("hello from \(message["host"] as? String ?? "?") \(message["host_version"] as? String ?? "?"), cache \(cache.directory)")
+        let parsed = parseSettings(message["settings"])
+        settings = parsed.settings
+        if !parsed.problems.isEmpty { output.report("warn", "settings: " + parsed.problems.joined(separator: "; ")) }
+        log("mosaic gap \(settings.gapPercent)%, stagger \(settings.staggerMs) ms")
         start()
     }
 
@@ -830,18 +981,24 @@ final class Controller {
             next.append(Slot(device: device, slot: slot, size: size))
         }
         let wasActive = active
+        let hadMosaic = !mosaics.isEmpty
         guard next != slots else { return }
         slots = next
-        log("keys: \(slots.isEmpty ? "none" : slots.map { "\($0.slot)@\($0.size)" }.joined(separator: " "))")
-        guard let first = slots.first else {
+        (mosaics, singles) = groupSlots(slots)
+        log("keys: \(slots.isEmpty ? "none" : slots.map { "\($0.slot)@\($0.size)" }.joined(separator: " "))"
+            + mosaics.map { " (mosaic \($0.device) \($0.page.isEmpty ? "page1:" : $0.page))" }.joined())
+        guard let first = singles.first ?? slots.first else {
             deactivate()
             return
         }
         if !wasActive || first.size != size {
             // Nothing was tracked while idle, and a new size needs a new render.
             size = first.size
-            shown = .unknown
-            shownPNG = nil
+            forgetShown()
+        } else if hadMosaic || !mosaics.isEmpty, let display = shownDisplay {
+            // A page that became or stopped being a mosaic is drawn again at
+            // once, all nine keys together.
+            show(display, quiet: true, now: Date())
         } else if let png = shownPNG {
             // A newly bound slot gets the current face at once.
             sendImage(png)
@@ -855,12 +1012,86 @@ final class Controller {
         pending = nil
         pendingAt = .distantFuture
         pendingReconcile = false
+        forgetShown()
+    }
+
+    func forgetShown() {
+        cancelReveal()
         shown = .unknown
+        shownDisplay = nil
         shownPNG = nil
+        shownTiles = [:]
     }
 
     func sendImage(_ png: Data) {
         output.send(["type": "image_all", "png": png.base64EncodedString()])
+    }
+
+    func sendImage(_ png: Data, device: String, slot: String) {
+        output.send(["type": "image", "device": device, "slot": slot, "png": png.base64EncodedString()])
+    }
+
+    func cancelReveal() {
+        for item in revealItems { item.cancel() }
+        revealItems = []
+    }
+
+    /// Sends a face: one image_all while no page is a mosaic, as always;
+    /// otherwise one image per key. Mosaics in `reveal` go one key at a time
+    /// in reading order, the stagger apart; every paint cancels the rest of a
+    /// reveal still under way.
+    func paint(single: Data?, tiles: [MosaicGroup: [Data]], reveal: Set<MosaicGroup>) {
+        cancelReveal()
+        if mosaics.isEmpty {
+            if let single { sendImage(single) }
+            return
+        }
+        if let single {
+            for slot in singles { sendImage(single, device: slot.device, slot: slot.slot) }
+        }
+        var later: [(MosaicGroup, [Data])] = []
+        for group in mosaics {
+            guard let pngs = tiles[group] else { continue }
+            if reveal.contains(group) && settings.staggerMs > 0 {
+                later.append((group, pngs))
+            } else {
+                for (i, name) in group.slots.enumerated() { sendImage(pngs[i], device: group.device, slot: name) }
+            }
+        }
+        guard !later.isEmpty else { return }
+        let step = settings.staggerMs / 1000
+        for i in 0..<gridSlots.count {
+            let send = { [unowned self] in
+                for (group, pngs) in later { self.sendImage(pngs[i], device: group.device, slot: group.slots[i]) }
+            }
+            if i == 0 {
+                send()
+                continue
+            }
+            let item = DispatchWorkItem { [unowned self] in
+                send()
+                if i == gridSlots.count - 1 { self.revealItems = [] }
+            }
+            revealItems.append(item)
+            DispatchQueue.main.asyncAfter(deadline: .now() + Double(i) * step, execute: item)
+        }
+    }
+
+    /// The unchanged face again, all at once. A reveal under way sends the
+    /// rest of the mosaic keys itself.
+    func resend() {
+        if mosaics.isEmpty {
+            if let png = shownPNG { sendImage(png) }
+            return
+        }
+        if let png = shownPNG {
+            for slot in singles { sendImage(png, device: slot.device, slot: slot.slot) }
+        }
+        guard revealItems.isEmpty else { return }
+        for group in mosaics {
+            guard let pngs = shownTiles[group] else { continue }
+            for (i, name) in group.slots.enumerated() { sendImage(pngs[i], device: group.device, slot: name) }
+        }
     }
 
     // MARK: Events
@@ -1005,12 +1236,16 @@ final class Controller {
         if shown != target {
             show(display, quiet: false, now: now)
         } else if reconcile {
-            if shownIsFallback || shownPNG == nil {
+            if shownIsFallback || faceMissing {
                 show(display, quiet: true, now: now)
-            } else if let png = shownPNG {
-                sendImage(png)
+            } else {
+                resend()
             }
         }
+    }
+
+    var faceMissing: Bool {
+        ((mosaics.isEmpty || !singles.isEmpty) && shownPNG == nil) || mosaics.contains { shownTiles[$0] == nil }
     }
 
     func succeeded() {
@@ -1031,12 +1266,15 @@ final class Controller {
     /// again for a minute, so retries do not each wait on the network.
     func artwork(for url: String, now: Date) -> CGImage? {
         if url.isEmpty { return nil }
-        if url == artURL, let artImage { return artImage }
+        // A mosaic needs the art at its whole canvas size.
+        let pixels = mosaics.map { 3 * $0.size + 2 * mosaicGap(size: $0.size) }.reduce(size * 3, max)
+        if url == artURL, let artImage, artPixels >= pixels { return artImage }
         if url == artFailedURL, now.timeIntervalSince(artFailedAt) < artRetryInterval { return nil }
-        let image = loadArtwork(url, maxPixels: size * 3)
+        let image = loadArtwork(url, maxPixels: pixels)
         if let image {
             artURL = url
             artImage = image
+            artPixels = pixels
         } else {
             artFailedURL = url
             artFailedAt = now
@@ -1045,12 +1283,13 @@ final class Controller {
         return image
     }
 
-    /// The change path: a cached tile is sent as is; otherwise the art is
-    /// fetched and the tile rendered into the cache. A tile whose art failed
-    /// to download is not cached, so a later reconcile or play retries it.
-    /// When the app icon cannot be read, the generic tile stands in (cached
-    /// under its own key) and counts as a fallback, so reconciles retry the icon.
-    func show(_ display: Display, quiet: Bool, now: Date) {
+    /// One full tile at `size`: a cached tile is used as is; otherwise the
+    /// art is fetched and the tile rendered into the cache. A tile whose art
+    /// failed to download is not cached, so a later reconcile or play retries
+    /// it. When the app icon cannot be read, the generic tile stands in (cached
+    /// under its own key) and counts as a fallback, so reconciles retry the
+    /// icon. Nil after a failure, which `failed` has already handled.
+    func face(_ display: Display, size: Int, now: Date) -> (png: Data, fallback: Bool, source: String)? {
         let target: Shown
         var cached: String
         var fallback = false
@@ -1092,7 +1331,7 @@ final class Controller {
             }
             guard let image, let data = pngData(image) else {
                 failed("rendering the \(target == .appIcon ? "app icon" : "track") tile", now: now)
-                return
+                return nil
             }
             png = data
             // The generic stand-in caches under its own key; only a track
@@ -1105,13 +1344,91 @@ final class Controller {
         }
         guard let png, png.count <= maxImageBytes else {
             failed("tile is larger than the host's \(maxImageBytes) byte limit", now: now)
-            return
+            return nil
         }
-        sendImage(png)
+        return (png, fallback, source)
+    }
+
+    func mosaicGap(size: Int) -> Int {
+        Int((Double(size) * settings.gapPercent / 100).rounded())
+    }
+
+    /// The nine keys of a mosaic page, in reading order, cached per key like
+    /// tiles. With no art to cut (Spotify not running, nothing loaded, or the
+    /// download failed) the center key shows the full tile and the rest are
+    /// black.
+    func mosaicFace(_ display: Display, group: MosaicGroup, now: Date) -> (pngs: [Data], fallback: Bool, source: String)? {
+        if case .track(let track) = display, !track.artworkURL.isEmpty {
+            let key = TrackKey(id: track.id, playing: track.playing)
+            let gap = mosaicGap(size: group.size)
+            let paths = gridSlots.indices.map {
+                cache.mosaicPath(for: key, art: track.artworkURL, gap: gap, position: $0, size: group.size)
+            }
+            let loaded = paths.compactMap { cache.load($0) }
+            if loaded.count == paths.count { return (loaded, false, "cached") }
+            if let art = artwork(for: track.artworkURL, now: now) {
+                let pngs = renderMosaic(art, paused: !track.playing, size: group.size, gap: gap)?.compactMap(pngData) ?? []
+                guard pngs.count == paths.count else {
+                    failed("rendering the mosaic", now: now)
+                    return nil
+                }
+                guard pngs.allSatisfy({ $0.count <= maxImageBytes }) else {
+                    failed("mosaic tile is larger than the host's \(maxImageBytes) byte limit", now: now)
+                    return nil
+                }
+                for (png, path) in zip(pngs, paths) where !cache.store(png, at: path) {
+                    log("error writing cache file \(path)")
+                }
+                let removed = cache.prune()
+                if removed > 0 { log("cache pruned \(removed) old tiles") }
+                return (pngs, false, "rendered")
+            }
+        }
+        guard let center = face(display, size: group.size, now: now) else { return nil }
+        guard let image = renderBlackTile(size: group.size), let black = pngData(image) else {
+            failed("rendering the mosaic", now: now)
+            return nil
+        }
+        var pngs = Array(repeating: black, count: gridSlots.count)
+        pngs[centerIndex] = center.png
+        return (pngs, center.fallback, center.source)
+    }
+
+    /// The change path: renders (or loads) the face for every bound key and
+    /// sends it. A new track on a mosaic already showing is revealed key by
+    /// key; everything else is sent at once.
+    func show(_ display: Display, quiet: Bool, now: Date) {
+        let target: Shown
+        switch display {
+        case .track(let track): target = .track(TrackKey(id: track.id, playing: track.playing))
+        case .appIcon: target = .appIcon
+        }
+        var single: Data?
+        var fallback = false
+        var source = "cached"
+        if mosaics.isEmpty || !singles.isEmpty {
+            guard let face = face(display, size: size, now: now) else { return }
+            (single, fallback, source) = (face.png, face.fallback, face.source)
+        }
+        var tiles: [MosaicGroup: [Data]] = [:]
+        for group in mosaics {
+            guard let face = mosaicFace(display, group: group, now: now) else { return }
+            tiles[group] = face.pngs
+            fallback = fallback || face.fallback
+            if single == nil { source = face.source }
+        }
+        var reveal: Set<MosaicGroup> = []
+        if case .track(let old)? = shownDisplay, case .track(let new) = display,
+           old.id != new.id || old.artworkURL != new.artworkURL {
+            reveal = Set(shownTiles.keys)
+        }
+        paint(single: single, tiles: tiles, reveal: reveal)
         let artRecovered = shownIsFallback && !fallback
         succeeded()
         shown = target
-        shownPNG = png
+        shownDisplay = display
+        shownPNG = single
+        shownTiles = tiles
         shownIsFallback = fallback
         if !quiet || artRecovered {
             switch display {

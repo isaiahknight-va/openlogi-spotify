@@ -23,10 +23,11 @@ _spec.loader.exec_module(fake_host)
 BINARY = os.environ.get("MODULE_TEST_BINARY", "")
 
 
-def write_png(path, width, height):
-    """A plain RGB gradient PNG, for album art."""
+def write_png(path, width, height, blue=160, srgb=False):
+    """A plain RGB gradient PNG, for album art: red follows x, green follows y.
+    `srgb` tags it sRGB, so its colors reach the tiles unconverted."""
     rows = b"".join(
-        b"\x00" + bytes(v for x in range(width) for v in (x * 255 // width, y * 255 // height, 160))
+        b"\x00" + bytes(v for x in range(width) for v in (x * 255 // width, y * 255 // height, blue))
         for y in range(height))
 
     def chunk(kind, data):
@@ -34,7 +35,60 @@ def write_png(path, width, height):
 
     with open(path, "wb") as f:
         f.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+                + (chunk(b"sRGB", b"\x00") if srgb else b"")
                 + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
+
+
+def read_png(data):
+    """(width, height, pixel) for an 8-bit, non-interlaced PNG; pixel(x, y)
+    gives (r, g, b, a), counting from the top left."""
+    width, height, depth, kind, _, _, interlace = struct.unpack(">IIBBBBB", data[16:29])
+    channels = {0: 1, 2: 3, 4: 2, 6: 4}[kind]
+    assert depth == 8 and interlace == 0, (depth, interlace)
+    raw, at = b"", 8
+    while at < len(data):
+        length, = struct.unpack(">I", data[at:at + 4])
+        if data[at + 4:at + 8] == b"IDAT":
+            raw += data[at + 8:at + 8 + length]
+        at += 12 + length
+    raw = zlib.decompress(raw)
+    stride = width * channels
+    rows, previous = [], bytearray(stride)
+    for y in range(height):
+        start = y * (stride + 1)
+        method, row = raw[start], bytearray(raw[start + 1:start + 1 + stride])
+        for i in range(stride):
+            left = row[i - channels] if i >= channels else 0
+            up = previous[i]
+            corner = previous[i - channels] if i >= channels else 0
+            if method == 1:
+                row[i] = (row[i] + left) & 255
+            elif method == 2:
+                row[i] = (row[i] + up) & 255
+            elif method == 3:
+                row[i] = (row[i] + (left + up) // 2) & 255
+            elif method == 4:
+                p = left + up - corner
+                pa, pb, pc = abs(p - left), abs(p - up), abs(p - corner)
+                row[i] = (row[i] + (left if pa <= pb and pa <= pc else up if pb <= pc else corner)) & 255
+        rows.append(bytes(row))
+        previous = row
+
+    def pixel(x, y):
+        v = rows[y][x * channels:(x + 1) * channels]
+        if channels == 1:
+            return (v[0], v[0], v[0], 255)
+        if channels == 2:
+            return (v[0], v[0], v[0], v[1])
+        if channels == 3:
+            return (v[0], v[1], v[2], 255)
+        return tuple(v)
+
+    return width, height, pixel
+
+
+GRID = ["gridTopLeft", "gridTopMiddle", "gridTopRight", "gridMiddleLeft", "gridMiddle",
+        "gridMiddleRight", "gridBottomLeft", "gridBottomMiddle", "gridBottomRight"]
 
 
 class ModuleTest(unittest.TestCase):
@@ -74,11 +128,11 @@ class ModuleTest(unittest.TestCase):
         except FileNotFoundError:
             return []
 
-    def start(self, reconcile=30):
+    def start(self, reconcile=30, settings=None):
         env = dict(os.environ, FAKE_SPOTIFY_DIR=self.dir, SPOTIFY_MODULE_CACHE_DIR=self.cache,
                    FAKE_SPOTIFY_RECONCILE=str(reconcile))
         self.host = fake_host.FakeHost([BINARY], env=env, out_dir=self.images)
-        self.host.hello()
+        self.host.hello(settings)
         ready = self.host.wait_for("ready", 10)
         self.assertIsNotNone(ready, "no ready within 10 s")
         return self.host
@@ -89,8 +143,46 @@ class ModuleTest(unittest.TestCase):
         self.assertIn("png", message)
         return message
 
-    def slot(self, size=118, name="gridMiddle"):
-        return {"device": "keypad-1", "slot": name, "size": size}
+    def slot(self, size=118, name="gridMiddle", device="keypad-1"):
+        return {"device": device, "slot": name, "size": size}
+
+    def page(self, prefix="", device="keypad-1", size=118):
+        return [self.slot(size=size, name=prefix + name, device=device) for name in GRID]
+
+    def keyed_images(self, count, timeout=3):
+        """The next `count` image messages (per key), in arrival order."""
+        got = []
+        deadline = time.monotonic() + timeout
+        while len(got) < count:
+            message = self.host.wait_for("image", deadline - time.monotonic())
+            self.assertIsNotNone(message, f"only {len(got)} of {count} key images")
+            got.append(message)
+        return got
+
+    def mosaic(self, messages, prefix="", device="keypad-1"):
+        """The nine images of one mosaic page, by grid position name."""
+        tiles = {m["slot"][len(prefix):]: m for m in messages
+                 if m["device"] == device and m["slot"].startswith(prefix) and m["slot"][len(prefix):] in GRID}
+        self.assertEqual(sorted(tiles), sorted(GRID))
+        return tiles
+
+    def assert_cut(self, tiles, size, gap_percent):
+        """Each key shows its own square of the art scaled over the canvas of
+        three keys and two gaps: red and green of the gradient art give back
+        the canvas position each pixel came from."""
+        gap = int(size * gap_percent / 100 + 0.5)
+        side = 3 * size + 2 * gap
+        self.assertEqual(len({t["png"] for t in tiles.values()}), 9, "the nine keys are not distinct")
+        for index, name in enumerate(GRID):
+            row, col = divmod(index, 3)
+            width, height, pixel = read_png(tiles[name]["_bytes"])
+            self.assertEqual((width, height), (size, size))
+            for px, py in ((6, 6), (size // 2, size // 3), (size - 7, size - 7)):
+                r, g, _, _ = pixel(px, py)
+                x = col * (size + gap) + px + 0.5
+                y = row * (size + gap) + py + 0.5
+                self.assertAlmostEqual(r * side / 255, x, delta=4, msg=f"{name} x at ({px},{py})")
+                self.assertAlmostEqual(g * side / 255, y, delta=4, msg=f"{name} y at ({px},{py})")
 
     # Protocol
 
@@ -325,6 +417,172 @@ class ModuleTest(unittest.TestCase):
         host.keys([self.slot(size=64)])
         self.assertEqual(fake_host.png_size(self.image(timeout=1.5)["_bytes"]), (64, 64))
         self.assertEqual(host.shutdown(timeout=2.0), 0)
+
+    # Mosaic
+
+    def position_art(self, name="position.png", blue=160):
+        path = os.path.join(self.dir, name)
+        write_png(path, 512, 512, blue=blue, srgb=True)
+        return path
+
+    def test_nine_keys_of_a_page_show_the_art_cut_across_them(self):
+        self.playing(artwork=self.position_art())
+        host = self.start()
+        host.keys(self.page())
+        tiles = self.mosaic(self.keyed_images(9))
+        self.assert_cut(tiles, 118, 25)
+        # Gap 30 at 118: the top-left key starts at the canvas's corner and the
+        # bottom-right one at 2 * (118 + 30).
+        _, _, top_left = read_png(tiles["gridTopLeft"]["_bytes"])
+        _, _, bottom_right = read_png(tiles["gridBottomRight"]["_bytes"])
+        self.assertLessEqual(top_left(0, 0)[0], 2)
+        self.assertAlmostEqual(bottom_right(0, 0)[0] * 414 / 255, 296, delta=4)
+        self.assertEqual([m for m in host.drain(0.5) if m["type"] == "image_all"], [])
+
+    def test_gap_setting_changes_the_cut(self):
+        self.playing(artwork=self.position_art())
+        host = self.start(settings={"mosaic_gap_percent": 0})
+        host.keys(self.page(size=96))
+        self.assert_cut(self.mosaic(self.keyed_images(9)), 96, 0)
+
+    def test_eight_keys_keep_the_full_tile(self):
+        self.playing(artwork=self.position_art())
+        host = self.start()
+        host.keys(self.page()[:8])
+        tile = self.image()
+        self.assertEqual(fake_host.png_size(tile["_bytes"]), (118, 118))
+        self.assertEqual([m for m in host.drain(0.6) if m["type"] == "image"], [])
+
+    def test_a_page2_mosaic_beside_single_keys(self):
+        self.playing(artwork=self.position_art())
+        host = self.start()
+        host.keys([self.slot()])
+        full = self.image()
+        singles = [self.slot(), *self.page(device="keypad-2")[:8]]
+        host.keys(self.page("page2:") + singles)
+        got = self.keyed_images(18)
+        self.assert_cut(self.mosaic(got, prefix="page2:"), 118, 25)
+        alone = [m for m in got if not m["slot"].startswith("page2:")]
+        self.assertEqual(sorted((m["device"], m["slot"]) for m in alone),
+                         sorted((s["device"], s["slot"]) for s in singles))
+        self.assertTrue(all(m["png"] == full["png"] for m in alone))
+        self.assertEqual([m for m in host.drain(0.5) if m["type"] == "image_all"], [])
+
+    def test_paused_mosaic_is_gray_with_play_on_the_center_key_only(self):
+        self.playing(state="paused", artwork=self.position_art())
+        host = self.start()
+        host.keys(self.page())
+        tiles = self.mosaic(self.keyed_images(9))
+        for name in GRID:
+            _, _, pixel = read_png(tiles[name]["_bytes"])
+            for px, py in ((6, 6), (110, 20), (20, 110)):
+                r, g, b, _ = pixel(px, py)
+                self.assertLessEqual(max(r, g, b) - min(r, g, b), 2, f"{name} is not gray at ({px},{py})")
+                self.assertLess(r, 160, f"{name} is not dimmed at ({px},{py})")
+            center = pixel(59, 59)
+            if name == "gridMiddle":
+                self.assertTrue(all(v >= 235 for v in center[:3]), f"no white play triangle: {center}")
+                self.assertLess(max(pixel(59, 70)[:3]), 90, "the dark circle is missing under the triangle")
+            else:
+                self.assertLess(max(center[:3]), 160, f"{name} has a play triangle")
+
+    def test_not_running_shows_the_icon_on_the_center_key_and_black_elsewhere(self):
+        self.set_state(running=False)
+        host = self.start()
+        host.keys([self.slot()])
+        icon = self.image()
+        host.keys(self.page())
+        tiles = self.mosaic(self.keyed_images(9))
+        self.assertEqual(tiles["gridMiddle"]["png"], icon["png"])
+        for name in GRID:
+            if name == "gridMiddle":
+                continue
+            width, height, pixel = read_png(tiles[name]["_bytes"])
+            self.assertTrue(all(pixel(x, y) == (0, 0, 0, 255) for y in range(height) for x in range(width)),
+                            f"{name} is not plain black")
+
+    def test_a_press_on_any_mosaic_key_plays_or_pauses_and_repaints_at_once(self):
+        self.playing(artwork=self.position_art())
+        host = self.start(settings={"mosaic_stagger_ms": 200})
+        host.keys(self.page())
+        self.keyed_images(9)
+        host.press(device="keypad-1", slot="gridTopLeft")
+        got = self.keyed_images(9, timeout=1.5)
+        self.assertLess(got[-1]["_at"] - got[0]["_at"], 0.12, "a play/pause toggle was staggered")
+        self.assertIn("playpause", self.calls())
+
+    def test_a_track_change_reveals_the_keys_in_reading_order(self):
+        self.playing(artwork=self.position_art())
+        host = self.start(settings={"mosaic_stagger_ms": 150})
+        host.keys(self.page())
+        first = self.keyed_images(9)
+        self.assertLess(first[-1]["_at"] - first[0]["_at"], 0.12, "the first paint was staggered")
+        self.playing(id="spotify:track:2", name="Another Song", artwork=self.position_art("b.png", blue=40))
+        got = self.keyed_images(9, timeout=5)
+        self.assertEqual([m["slot"] for m in got], GRID)
+        times = [m["_at"] for m in got]
+        self.assertTrue(all(b - a >= 0.03 for a, b in zip(times, times[1:])), times)
+        self.assertGreater(times[-1] - times[0], 0.9, times)
+        self.assertLess(times[-1] - times[0], 4.0, times)
+
+    def test_a_second_track_change_cancels_the_rest_of_the_reveal(self):
+        self.playing(artwork=self.position_art())
+        host = self.start(settings={"mosaic_stagger_ms": 300})
+        host.keys(self.page())
+        self.keyed_images(9)
+        self.playing(id="spotify:track:2", name="B", artwork=self.position_art("b.png", blue=40))
+        got = self.keyed_images(1, timeout=3)
+        time.sleep(0.65)
+        self.playing(id="spotify:track:3", name="C", artwork=self.position_art("c.png", blue=240))
+        got += [m for m in host.drain(4.5) if m["type"] == "image"]
+
+        def blue(message):
+            return read_png(message["_bytes"])[2](59, 59)[2]
+
+        arts = ["B" if abs(blue(m) - 40) <= 3 else "C" if abs(blue(m) - 240) <= 3 else "?" for m in got]
+        self.assertNotIn("?", arts)
+        b_count = arts.count("B")
+        self.assertEqual(arts, ["B"] * b_count + ["C"] * 9, arts)
+        self.assertTrue(1 <= b_count < 9, arts)
+        self.assertEqual([m["slot"] for m in got], GRID[:b_count] + GRID)
+
+    def test_stagger_zero_sends_all_nine_at_once(self):
+        self.playing(artwork=self.position_art())
+        host = self.start(settings={"mosaic_stagger_ms": 0})
+        host.keys(self.page())
+        self.keyed_images(9)
+        self.playing(id="spotify:track:2", name="Another Song", artwork=self.position_art("b.png", blue=40))
+        got = self.keyed_images(9, timeout=3)
+        self.assertEqual([m["slot"] for m in got], GRID)
+        self.assertLess(got[-1]["_at"] - got[0]["_at"], 0.12)
+
+    def test_mosaic_tiles_are_cached_per_key(self):
+        self.playing(artwork=self.position_art())
+        host = self.start()
+        host.keys(self.page())
+        first = self.keyed_images(9)
+        self.assertEqual(len([n for n in os.listdir(self.cache) if n.endswith(".png")]), 9)
+        self.assertEqual(host.shutdown(), 0)
+        self.assertEqual(host.problems, [])
+        os.remove(self.position_art())   # only the cache can draw it now
+        self.start().keys(self.page())
+        again = self.keyed_images(9)
+        self.assertEqual([m["png"] for m in again], [m["png"] for m in first])
+
+    def test_bad_settings_fall_back_with_one_warning(self):
+        self.playing()
+        host = self.start(settings={"mosaic_gap_percent": "wide", "mosaic_stagger_ms": 5000})
+        got = host.drain(0.8)
+        warnings = [m for m in got if m["type"] == "log" and m["level"] == "warn"]
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("mosaic_gap_percent wide is not a number; using 25", warnings[0]["message"])
+        self.assertIn("mosaic_stagger_ms 5000 is outside 0 to 1000; using 1000", warnings[0]["message"])
+
+    def test_good_settings_log_no_warning(self):
+        self.playing()
+        host = self.start(settings={"mosaic_gap_percent": 12.5, "mosaic_stagger_ms": 0})
+        got = host.drain(0.8)
+        self.assertEqual([m for m in got if m["type"] == "log" and m["level"] == "warn"], [])
 
 
 class SelfTest(unittest.TestCase):
