@@ -133,12 +133,13 @@ controls take the album's colors) and an accent color picked from the cover.
 | `album` | The album name alone, on this one key. | Plays or pauses. |
 | `shuffle` | Shuffle arrows; in the accent color with an underline when on. | Turns shuffle on or off. |
 | `repeat` | The repeat loop, on or off like shuffle. | Turns repeat on or off. |
+| `liked` | A heart in the accent color, labeled Liked Songs. | Plays your Liked Songs, launching Spotify first if it is not running. Shuffle and repeat stay as they are. |
 | `time` | The time into the track, with a ring that fills as it plays, updated every second. | Jumps back 15 seconds. |
 | `previous` | Skip back. | Previous track. |
 | `next` | Skip forward. | Next track. |
 
 For example, page 2 of a Spotify profile: the song, artist, and album over
-shuffle, time, and repeat, over previous, art, and next:
+shuffle, time, and Liked Songs, over previous, art, and next:
 
 ```toml
 [modules."com.typ.openlogi.spotify".settings.keys]
@@ -147,7 +148,7 @@ shuffle, time, and repeat, over previous, art, and next:
 "page2:gridTopRight" = "album"
 "page2:gridMiddleLeft" = "shuffle"
 "page2:gridMiddle" = "time"
-"page2:gridMiddleRight" = "repeat"
+"page2:gridMiddleRight" = "liked"
 "page2:gridBottomLeft" = "previous"
 "page2:gridBottomMiddle" = "art"
 "page2:gridBottomRight" = "next"
@@ -178,10 +179,34 @@ in an ellipsis. Titles do not scroll while paused.
   (page 2 here), so another profile's key on that slot is not turned into a
   control.
 - With Spotify not running or nothing loaded, the control keys go dim and
-  their presses do nothing; the title and the song key say Nothing playing,
+  their presses do nothing (except `liked`, which launches Spotify); the title and the song key say Nothing playing,
   the artist and album keys go blank, and the art key shows the app icon.
 - A role that is not one of these, or is not text, counts as `art` and puts
   one warning in OpenLogi's log.
+
+### Liked Songs key
+
+A `liked` key plays your Liked Songs. It first asks Spotify for
+`spotify:collection:tracks`. If that does not start your Liked Songs, give
+the module your Spotify profile, and the key asks for your own collection
+first:
+
+1. In Spotify, click your profile picture and choose **Profile**.
+2. Click the three dots under your name, then **Share**, then **Copy link to
+   profile**.
+3. Paste it into the module's settings:
+
+```toml
+[modules."com.typ.openlogi.spotify".settings]
+spotify_profile = "https://open.spotify.com/user/your-username"
+```
+
+`spotify_profile` is optional. It also takes a `spotify:user:` URI or the
+user name alone. Anything else (a playlist or track link, for example) puts
+one warning in OpenLogi's log, and the key plays `spotify:collection:tracks`
+only. A key press tries your collection, then `spotify:collection:tracks`,
+and puts one line in the log naming the one that started, or saying neither
+did.
 
 While a shuffle, repeat, or time key is bound and a track is loaded, the
 module reads Spotify once a second, so a change made in the Spotify app

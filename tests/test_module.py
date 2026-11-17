@@ -95,6 +95,11 @@ PAGE2_ROLES = dict(zip(["page2:" + name for name in GRID],
 TEXT_ROLES = dict(PAGE2_ROLES, **{"page2:gridTopLeft": "song", "page2:gridTopMiddle": "artist",
                                   "page2:gridTopRight": "album"})
 TEXT_SLOTS = ["page2:gridTopLeft", "page2:gridTopMiddle", "page2:gridTopRight"]
+LIKED_ROLES = dict(PAGE2_ROLES, **{"page2:gridMiddleRight": "liked"})
+LIKED = "page2:gridMiddleRight"
+PROFILE = "https://open.spotify.com/user/your-username?si=abc123"   # a placeholder, never a real user
+USER_URI = "spotify:user:your-username:collection"
+GENERIC_URI = "spotify:collection:tracks"
 
 
 class ModuleTest(unittest.TestCase):
@@ -875,6 +880,110 @@ class ModuleTest(unittest.TestCase):
         latest = self.by_slot(m for m in host.drain(1.0) if m["type"] == "image")
         self.assertIn("playpause", self.calls())
         self.assertEqual(latest["page2:gridTopMiddle"]["_bytes"], self.walkin_preview("page2:gridTopMiddle", "--paused"))
+
+    # Liked Songs key
+
+    def played_uris(self):
+        return [c[len("play-uri:"):] for c in self.calls() if c.startswith("play-uri:")]
+
+    def logs(self, level):
+        return [m["message"] for m in self.host.received if m["type"] == "log" and m["level"] == level]
+
+    def state(self):
+        with open(os.path.join(self.dir, "state.json")) as f:
+            return json.load(f)
+
+    def press_liked(self, settings):
+        """Presses the liked key and waits for its one Liked Songs log line."""
+        host = self.start(settings=dict(settings, keys=LIKED_ROLES))
+        host.keys(self.page("page2:"))
+        self.keyed_images(9)
+        host.press(device="keypad-1", slot=LIKED)
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            message = host.wait_for("log", deadline - time.monotonic())
+            if message is None or "Liked Songs" in message["message"]:
+                break
+        host.drain(0.3)
+        return host
+
+    def test_liked_role_is_accepted_and_its_face_is_stable(self):
+        self.walkin(position=30, duration=200000)
+        host = self.start(settings={"keys": LIKED_ROLES, "spotify_profile": PROFILE})
+        host.keys(self.page("page2:"))
+        got = self.by_slot(self.keyed_images(9))
+        self.assertEqual(self.logs("warn"), [])
+        face = got[LIKED]["_bytes"]
+        self.assertEqual(face, self.preview("--role", "liked", "--slot", "gridMiddleRight", "--title", "Walkin' On The Sun",
+                                            "--artist", "Smash Mouth", "--artwork", self.position_art()))
+        self.assertNotEqual(face, got["page2:gridMiddleLeft"]["_bytes"])
+        later = [m for m in host.drain(2.2) if m["type"] in ("image", "image_all")]
+        self.assertTrue(later, "the time key did not tick")
+        self.assertNotIn(LIKED, {m["slot"] for m in later})
+        self.assertEqual(self.played_uris(), [])
+
+    def test_liked_press_plays_the_profile_collection_first(self):
+        self.walkin(state="paused", shuffling=True, repeating=False)
+        self.press_liked({"spotify_profile": PROFILE})
+        self.assertEqual(self.played_uris(), [USER_URI])
+        state = self.state()
+        self.assertEqual((state["state"], state["id"]), ("playing", "liked:" + USER_URI))
+        self.assertEqual((state["shuffling"], state["repeating"]), (True, False))
+        self.assertFalse({"playpause", "shuffle", "repeat", "launch"} & set(self.calls()), self.calls())
+        self.assertEqual([m for m in self.logs("info") if "Liked Songs" in m], ["Liked Songs: playing " + USER_URI])
+
+    def test_liked_falls_back_when_the_profile_collection_does_not_play(self):
+        for failure in ("dead_uris", "uri_errors"):
+            with self.subTest(failure=failure):
+                self.walkin(**{failure: [USER_URI]})
+                host = self.press_liked({"spotify_profile": "spotify:user:your-username"})
+                self.assertEqual(self.played_uris()[0], USER_URI)
+                self.assertEqual(self.played_uris()[-1], GENERIC_URI)
+                self.assertEqual(self.state()["id"], "liked:" + GENERIC_URI)
+                self.assertEqual([m for m in self.logs("info") if "Liked Songs" in m], ["Liked Songs: playing " + GENERIC_URI])
+                self.assertEqual(host.shutdown(), 0)
+                self.assertEqual(host.problems, [])
+                os.remove(os.path.join(self.dir, "calls.log"))
+
+    def test_liked_reports_once_when_nothing_plays(self):
+        self.walkin(state="paused", dead_uris=[USER_URI, GENERIC_URI])
+        self.press_liked({"spotify_profile": "your-username"})
+        self.assertEqual(self.played_uris()[0], USER_URI)
+        self.assertEqual(self.played_uris()[-1], GENERIC_URI)
+        failed = [m for m in self.logs("warn") if "Liked Songs" in m]
+        self.assertEqual(failed, [f"Liked Songs did not start; tried {USER_URI} then {GENERIC_URI}"])
+        self.assertEqual(self.state()["state"], "paused")
+
+    def test_a_bad_spotify_profile_is_reported_and_only_the_generic_collection_plays(self):
+        for bad in ("https://open.spotify.com/playlist/abc123DEF456", "your\"user", "your user"):
+            with self.subTest(bad=bad):
+                self.walkin(state="paused")
+                host = self.press_liked({"spotify_profile": bad})
+                warnings = self.logs("warn")
+                self.assertEqual(len(warnings), 1, warnings)
+                self.assertIn("spotify_profile is not a profile link", warnings[0])
+                self.assertEqual(self.played_uris(), [GENERIC_URI])
+                self.assertEqual(self.state()["state"], "playing")
+                self.assertEqual(host.shutdown(), 0)
+                self.assertEqual(host.problems, [])
+                os.remove(os.path.join(self.dir, "calls.log"))
+
+    def test_liked_press_launches_spotify_when_not_running(self):
+        self.set_state(running=False, state="stopped", plays_needed=3)
+        self.press_liked({})
+        calls = self.calls()
+        self.assertEqual(calls.count("launch"), 1)
+        uris = self.played_uris()
+        self.assertGreaterEqual(len(uris), 3)
+        self.assertEqual(set(uris), {GENERIC_URI})
+        self.assertLess(calls.index("launch"), calls.index("play-uri:" + GENERIC_URI))
+        self.assertEqual((self.state()["state"], self.state()["id"]), ("playing", "liked:" + GENERIC_URI))
+        self.assertNotIn("play", calls)
+
+    def test_spotify_profile_forms_are_parsed(self):
+        result = subprocess.run([BINARY, "--self-test"], capture_output=True, text=True, timeout=30)
+        for check in ("spotify_profile accepts a link, a URI, or a bare name", "spotify_profile rejects anything else"):
+            self.assertIn("PASS " + check + "\n", result.stdout)
 
 
 class SelfTest(unittest.TestCase):

@@ -47,6 +47,8 @@ let firstRetryDelay: TimeInterval = 1
 let maxBackoff: TimeInterval = 10
 let playTries = 40
 let playTryInterval: TimeInterval = 0.25
+let likedChecks = 8              // turns a Liked Songs URI gets, Spotify running
+let likedLaunchChecks = 20       // and just launched
 let cacheLimit = 300
 let cachePruneTarget = 250
 // Part of every cache key: bump it when the tile design changes so old
@@ -366,9 +368,9 @@ func renderBlackTile(size: Int) -> CGImage? {
 /// What a bound key shows and does. `art` is the full tile; the rest make up
 /// a control page (settings `keys`).
 enum Role: String {
-    case art, title, shuffle, `repeat`, time, previous, next, song, artist, album
+    case art, title, shuffle, `repeat`, time, previous, next, song, artist, album, liked
 
-    /// The command a press sends; nil for the play/pause keys.
+    /// The command a press sends; nil for the play/pause keys and liked.
     var command: PlayerCommand? {
         switch self {
         case .shuffle: return .toggleShuffle
@@ -376,7 +378,7 @@ enum Role: String {
         case .time: return .seekBack
         case .previous: return .previous
         case .next: return .next
-        case .art, .title, .song, .artist, .album: return nil
+        case .art, .title, .song, .artist, .album, .liked: return nil
         }
     }
 
@@ -612,6 +614,24 @@ func drawRepeatIcon(center: CGPoint, k: CGFloat, color: CGColor, context: CGCont
     strokeIcon(path, color: color, width: 3.4 * k, context: context)
 }
 
+/// A heart: two round lobes over a point.
+func drawHeartIcon(center: CGPoint, k: CGFloat, color: CGColor, context: CGContext) {
+    let w = 34 * k, h = 30 * k
+    let r = w / 4
+    let lobes = center.y + h / 2 - r
+    let tip = CGPoint(x: center.x, y: center.y - h / 2)
+    let path = CGMutablePath()
+    path.move(to: tip)
+    path.addQuadCurve(to: CGPoint(x: center.x - 2 * r, y: lobes), control: CGPoint(x: center.x - 2 * r, y: tip.y + h * 0.42))
+    path.addArc(center: CGPoint(x: center.x - r, y: lobes), radius: r, startAngle: .pi, endAngle: 0, clockwise: true)
+    path.addArc(center: CGPoint(x: center.x + r, y: lobes), radius: r, startAngle: .pi, endAngle: 0, clockwise: true)
+    path.addQuadCurve(to: tip, control: CGPoint(x: center.x + 2 * r, y: tip.y + h * 0.42))
+    path.closeSubpath()
+    context.setFillColor(color)
+    context.addPath(path)
+    context.fillPath()
+}
+
 /// Two triangles and a bar: next, or mirrored, previous.
 func drawSkipIcon(forward: Bool, center: CGPoint, k: CGFloat, color: CGColor, context: CGContext) {
     context.saveGState()
@@ -672,6 +692,10 @@ func renderControl(_ state: ControlState, background: CGImage, accent: CGColor, 
     case .repeat:
         drawRepeatIcon(center: iconCenter, k: k, color: color, context: context)
         label("Repeat")
+    case .liked:
+        drawHeartIcon(center: iconCenter, k: k, color: state.enabled ? accent : color, context: context)
+        let full = CTLineCreateWithAttributedString(attributed("Liked Songs", font: font(size: 13 * k, weight: .medium), color: color))
+        label(visibleWidth(full) <= s - 16 * k ? "Liked Songs" : "Liked")
     case .previous, .next:
         drawSkipIcon(forward: state.role == .next, center: CGPoint(x: s / 2, y: s / 2), k: k, color: color, context: context)
     case .time:
@@ -979,6 +1003,9 @@ protocol SpotifyBackend: AnyObject {
     func read(extended: Bool, album: Bool) -> SpotifyState
     func playPause() -> CommandOutcome
     func command(_ command: PlayerCommand) -> CommandOutcome
+    /// `play track` with a Spotify URI; done means Spotify took the command,
+    /// not that anything started.
+    func playURI(_ uri: String) -> CommandOutcome
     func launch() -> CommandOutcome
     /// One `play`; true once the player reports playing.
     func tryPlay() -> Bool
@@ -1082,6 +1109,20 @@ func commandSource(_ command: PlayerCommand) -> String {
     """
 }
 
+/// Only for URIs built from checked parts (see `profileUser`): the URI
+/// goes into the script as is.
+func playURISource(_ uri: String) -> String {
+    """
+    if application id "com.spotify.client" is running then
+      with timeout of 5 seconds
+        tell application id "com.spotify.client" to play track "\(uri)"
+      end timeout
+      return "done"
+    end if
+    return "not running"
+    """
+}
+
 let playPauseSource = """
 if application id "com.spotify.client" is running then
   with timeout of 5 seconds
@@ -1118,6 +1159,7 @@ final class SpotifyReader: SpotifyBackend {
     private let albumReader = Script(readAlbumSource)
     private let extendedAlbumReader = Script(readExtendedAlbumSource)
     private var commandScripts: [String: Script] = [:]
+    private var uriScripts: [String: Script] = [:]
     private let playPauseScript = Script(playPauseSource)
     private let launchScript = Script(launchSource)
     private let tryPlayScript = Script(tryPlaySource)
@@ -1167,6 +1209,18 @@ final class SpotifyReader: SpotifyBackend {
     func command(_ command: PlayerCommand) -> CommandOutcome {
         let script = commandScripts[command.rawValue] ?? Script(commandSource(command))
         commandScripts[command.rawValue] = script
+        switch script.run() {
+        case .failure(let error):
+            if error.number == -600 || error.number == -609 { return .notRunning }
+            return .failed(error.description)
+        case .success(let result):
+            return result.stringValue == "done" ? .done : .notRunning
+        }
+    }
+
+    func playURI(_ uri: String) -> CommandOutcome {
+        let script = uriScripts[uri] ?? Script(playURISource(uri))
+        uriScripts[uri] = script
         switch script.run() {
         case .failure(let error):
             if error.number == -600 || error.number == -609 { return .notRunning }
@@ -1478,11 +1532,49 @@ func groupSlots(_ slots: [Slot], roles: [String: Role] = [:]) -> Layout {
     return layout
 }
 
+/// A Liked Songs press under way.
+struct LikedPlay {
+    var uris: [String]
+    var before: TrackKey?        // what played before the press; nil after a launch
+    var launched: Bool
+    var ready: Bool              // Spotify answers reads
+    var index = 0                // the URI being tried
+    var step = 0                 // turns spent on it
+    var played: String?
+}
+
 struct Settings {
     var gapPercent = defaultGapPercent
     var staggerMs = defaultStaggerMs
     var bannerFps = defaultBannerFps
     var roles: [String: Role] = [:]
+    var profileUser: String?     // from spotify_profile
+}
+
+/// The user name in a `spotify_profile` setting: a profile link
+/// (https://open.spotify.com/user/NAME?si=..., with or without the scheme or
+/// an /intl-xx/ part), a spotify:user:NAME URI, or a bare NAME. Nil unless the
+/// name is 1 to 64 ASCII letters, digits, dots, underscores, or hyphens, which
+/// makes it safe to put in a URI and an AppleScript as is.
+func profileUser(_ value: Any) -> String? {
+    guard var text = (value as? String)?.trimmingCharacters(in: .whitespaces) else { return nil }
+    if text.hasPrefix("spotify:user:") {
+        text.removeFirst("spotify:user:".count)
+    } else {
+        for scheme in ["https://", "http://"] where text.hasPrefix(scheme) { text.removeFirst(scheme.count) }
+        if text.hasPrefix("open.spotify.com/") {
+            let path = text.dropFirst("open.spotify.com/".count).prefix { $0 != "?" && $0 != "#" }
+            var parts = path.split(separator: "/").map(String.init)
+            if parts.first?.hasPrefix("intl-") == true { parts.removeFirst() }
+            guard parts.count == 2, parts[0] == "user" else { return nil }
+            text = parts[1]
+        }
+    }
+    guard (1...64).contains(text.utf8.count),
+          text.utf8.allSatisfy({ ($0 >= 0x30 && $0 <= 0x39) || ($0 >= 0x41 && $0 <= 0x5A) || ($0 >= 0x61 && $0 <= 0x7A)
+              || $0 == 0x2E || $0 == 0x5F || $0 == 0x2D })
+    else { return nil }
+    return text
 }
 
 /// The `settings` table from `hello`. A missing key takes its default; a
@@ -1525,7 +1617,15 @@ func parseSettings(_ value: Any?) -> (settings: Settings, problems: [String]) {
             problems.append("keys is not a table; using art for every key")
         }
     }
-    let known: Set = ["mosaic_gap_percent", "mosaic_stagger_ms", "banner_fps", "keys"]
+    if let raw = table["spotify_profile"] {
+        settings.profileUser = profileUser(raw)
+        if settings.profileUser == nil {
+            problems.append("spotify_profile is not a profile link (https://open.spotify.com/user/NAME), "
+                + "a spotify:user:NAME URI, or a NAME of 1 to 64 letters, digits, dots, underscores, or hyphens; "
+                + "the liked key plays spotify:collection:tracks")
+        }
+    }
+    let known: Set = ["mosaic_gap_percent", "mosaic_stagger_ms", "banner_fps", "keys", "spotify_profile"]
     for key in table.keys.sorted() where !known.contains(key) {
         problems.append("ignoring unknown setting \(key)")
     }
@@ -1579,6 +1679,7 @@ final class Controller {
     var artFailedAt = Date.distantPast
 
     var launching = false
+    var likedPlay: LikedPlay?
     var pending: DispatchWorkItem?
     var pendingAt = Date.distantFuture
     var pendingReconcile = false
@@ -1818,8 +1919,13 @@ final class Controller {
     // MARK: Presses
 
     /// A control key sends its command, only while Spotify is running, and
-    /// is drawn again from a fresh read; every other key plays or pauses.
+    /// is drawn again from a fresh read; liked plays Liked Songs; every other
+    /// key plays or pauses.
     func press(slot: String?) {
+        if let slot, gridSlots.contains(splitSlot(slot).name), settings.roles[slot] == .liked {
+            pressLiked()
+            return
+        }
         guard let slot, gridSlots.contains(splitSlot(slot).name),
               let role = settings.roles[slot], let command = role.command else {
             press()
@@ -1861,33 +1967,126 @@ final class Controller {
                 break
             }
         }
+        guard launchForPress("play") else { return }
+        retry(tries: playTries, step: { [unowned self] in self.backend.tryPlay() }) { [unowned self] started, attempt in
+            self.launching = false
+            if started {
+                log("Spotify started playing (try \(attempt))")
+            } else {
+                self.output.report("warn", "Spotify did not start playing after \(playTries) tries")
+            }
+            self.schedule(after: 0, reconcile: false)
+        }
+    }
+
+    /// Launches Spotify for a press; false when it is not installed or did
+    /// not launch, both already reported.
+    func launchForPress(_ what: String) -> Bool {
         guard backend.isInstalled() else {
             output.report("warn", "press ignored: Spotify is not installed")
-            return
+            return false
         }
         if case .failed(let message) = backend.launch() {
             output.report("error", "launching Spotify failed: \(message)")
-            return
+            return false
         }
-        log("press: launching Spotify to play")
+        log("press: launching Spotify to \(what)")
         launching = true
-        tryPlay(attempt: 1)
+        return true
     }
 
-    func tryPlay(attempt: Int) {
+    /// Calls `step` once per main queue turn, 0.25 s apart, until it returns
+    /// true or `tries` turns pass, then `finish` with whether it did and on
+    /// which try.
+    func retry(attempt: Int = 1, tries: Int, step: @escaping () -> Bool, finish: @escaping (Bool, Int) -> Void) {
         DispatchQueue.main.asyncAfter(deadline: .now() + playTryInterval) { [unowned self] in
-            if self.backend.tryPlay() {
-                self.launching = false
-                log("Spotify started playing (try \(attempt))")
-                self.schedule(after: 0, reconcile: false)
-            } else if attempt >= playTries {
-                self.launching = false
-                self.output.report("warn", "Spotify did not start playing after \(playTries) tries")
-                self.schedule(after: 0, reconcile: false)
+            if step() {
+                finish(true, attempt)
+            } else if attempt >= tries {
+                finish(false, attempt)
             } else {
-                self.tryPlay(attempt: attempt + 1)
+                self.retry(attempt: attempt + 1, tries: tries, step: step, finish: finish)
             }
         }
+    }
+
+    // MARK: Liked Songs
+
+    /// Liked Songs as Spotify URIs, tried in order: the user's collection when
+    /// `spotify_profile` is set, then the generic one.
+    var likedURIs: [String] {
+        (settings.profileUser.map { ["spotify:user:\($0):collection"] } ?? []) + ["spotify:collection:tracks"]
+    }
+
+    /// Plays Liked Songs, launching Spotify first when it is not running. A
+    /// URI counts as working once Spotify plays something other than what it
+    /// played before the press; one that does not within its checks gives way
+    /// to the next. One log line per press names the URI that worked, or says
+    /// none did. Shuffle and repeat are left as they are.
+    func pressLiked() {
+        if launching || likedPlay != nil {
+            log("press ignored: Spotify is still starting")
+            return
+        }
+        let running = backend.isRunning()
+        var before: TrackKey?
+        if running, case .track(let track) = backend.read(extended: false, album: false) {
+            before = TrackKey(id: track.id, playing: track.playing)
+        }
+        if !running, !launchForPress("play Liked Songs") { return }
+        let uris = likedURIs
+        likedPlay = LikedPlay(uris: uris, before: before, launched: !running, ready: running)
+        let tries = (running ? 0 : playTries) + uris.count * (running ? likedChecks : likedLaunchChecks) + 1
+        retry(tries: tries, step: { [unowned self] in self.likedStep() }) { [unowned self] _, _ in
+            if let played = self.likedPlay?.played {
+                self.output.report("info", "Liked Songs: playing \(played)")
+            } else {
+                self.output.report("warn", "Liked Songs did not start; tried \(uris.joined(separator: " then "))")
+            }
+            self.likedPlay = nil
+            self.launching = false
+            self.schedule(after: 0, reconcile: false)
+        }
+    }
+
+    /// One turn of a Liked Songs press: confirm the URI asked for, move on
+    /// from it after its checks, or ask for it (again). True when done.
+    func likedStep() -> Bool {
+        guard var play = likedPlay else { return true }
+        defer { likedPlay = play }
+        if !play.ready {
+            // Launched by this press: wait until Spotify answers a read.
+            switch backend.read(extended: false, album: false) {
+            case .idle, .track: play.ready = true
+            case .notRunning, .failed: return false
+            }
+        }
+        let checks = play.launched ? likedLaunchChecks : likedChecks
+        if play.step > 0, case .track(let track) = backend.read(extended: false, album: false), track.playing,
+           play.before.map({ !$0.playing || $0.id != track.id }) ?? true {
+            play.played = play.uris[play.index]
+            return true
+        }
+        if play.step >= checks {
+            play.index += 1
+            play.step = 0
+            if play.index == play.uris.count { return true }
+        }
+        // Asked again now and then: a just-launched Spotify drops early commands.
+        if play.step % (play.launched ? 2 : 4) == 0 {
+            switch backend.playURI(play.uris[play.index]) {
+            case .done:
+                break
+            case .notRunning:
+                return true
+            case .failed(let message):
+                log("play track \(play.uris[play.index]) failed: \(message)")
+                play.step = checks
+                return false
+            }
+        }
+        play.step += 1
+        return false
     }
 
     // MARK: Read and show
@@ -2365,10 +2564,10 @@ usage: spotify-module
              nor OpenLogi. With --app-icon it renders the Spotify-not-running
              tile; without --title or --app-icon, the generic stand-in.
   --role     render a control key instead (shuffle, repeat, time, previous,
-             next, song, artist, album) as it looks at grid SLOT (default
-             gridMiddle) of a control page, or with title the banner across
-             the top row. Without --title or --artwork it is drawn as with
-             nothing loaded.
+             next, song, artist, album, liked) as it looks at grid SLOT
+             (default gridMiddle) of a control page, or with title the banner
+             across the top row. Without --title or --artwork it is drawn as
+             with nothing loaded.
 """
 
 func runPreview(_ args: [String]) -> Never {

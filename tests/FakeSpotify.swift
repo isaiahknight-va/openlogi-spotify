@@ -7,7 +7,11 @@
 //    "id": "...", "name": "...", "artist": "...", "artwork": "/path/or/url",
 //    "plays_needed": 3, "read_error": "message",
 //    "shuffling": false, "repeating": false, "position": 12.5, "duration": 200000,
-//    "album": "..."}
+//    "album": "...", "dead_uris": ["..."], "uri_errors": ["..."]}
+// `play track` with a URI in `dead_uris` is taken but plays nothing, as
+// Spotify does with a URI it cannot play; one in `uri_errors` fails. Any other
+// URI plays its first track, `liked:<uri>`, once `plays_needed` plays have
+// been asked for since the last launch.
 // `position` is in seconds and advances with the clock from the file's last
 // write while playing; `duration` is in milliseconds, as Spotify reports it.
 // Every call is appended to $FAKE_SPOTIFY_DIR/calls.log, one word per line;
@@ -135,6 +139,23 @@ final class FakeSpotify: SpotifyBackend {
         return .done
     }
 
+    func playURI(_ uri: String) -> CommandOutcome {
+        record("play-uri:" + uri)
+        var state = load()
+        guard state["running"] as? Bool ?? false else { return .notRunning }
+        if (state["uri_errors"] as? [String] ?? []).contains(uri) { return .failed("cannot play \(uri) [-10000]") }
+        plays += 1
+        guard plays >= state["plays_needed"] as? Int ?? 1, !(state["dead_uris"] as? [String] ?? []).contains(uri) else {
+            return .done
+        }
+        state["state"] = "playing"
+        state["id"] = "liked:" + uri
+        state["name"] = "First Liked Song"
+        state["position"] = 0
+        save(state)
+        return .done
+    }
+
     func launch() -> CommandOutcome {
         record("launch")
         var state = load()
@@ -224,5 +245,29 @@ func runSelfTest() -> Never {
           && stress.lines.count == 3 && album.lines.count == 3 && endsInEllipsis(stress) && endsInEllipsis(album)
           && !endsInEllipsis(short) && !endsInEllipsis(long))
     check("an empty text key has no lines", fit("").lines.isEmpty)
+
+    // spotify_profile: every way to give a profile, and things that are not one.
+    let accepted: [(String, String)] = [
+        ("https://open.spotify.com/user/your-username?si=abc123", "your-username"),
+        ("https://open.spotify.com/user/your-username/", "your-username"),
+        ("http://open.spotify.com/user/test.user_1", "test.user_1"),
+        ("open.spotify.com/user/your-username", "your-username"),
+        ("https://open.spotify.com/intl-de/user/your-username?si=x", "your-username"),
+        ("https://open.spotify.com/user/your-username#top", "your-username"),
+        ("spotify:user:your-username", "your-username"),
+        ("your-username", "your-username"),
+        ("  test.user_1  ", "test.user_1"),
+    ]
+    check("spotify_profile accepts a link, a URI, or a bare name",
+          accepted.allSatisfy { profileUser($0.0) == $0.1 })
+    let rejected: [Any] = [
+        "https://open.spotify.com/playlist/abc123DEF456",
+        "https://open.spotify.com/track/xyz789GHI012?si=1",
+        "spotify:user:your-username:playlist:abc",
+        "https://example.com/user/your-username",
+        "https://open.spotify.com/user/",
+        "your user", "your\"user", "your'user", "", String(repeating: "a", count: 65), "not a link at all!", 42,
+    ]
+    check("spotify_profile rejects anything else", rejected.allSatisfy { profileUser($0) == nil })
     exit(failures == 0 ? 0 : 1)
 }
