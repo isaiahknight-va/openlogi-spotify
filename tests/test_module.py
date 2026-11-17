@@ -92,6 +92,9 @@ GRID = ["gridTopLeft", "gridTopMiddle", "gridTopRight", "gridMiddleLeft", "gridM
         "gridMiddleRight", "gridBottomLeft", "gridBottomMiddle", "gridBottomRight"]
 PAGE2_ROLES = dict(zip(["page2:" + name for name in GRID],
                        ["title", "title", "title", "shuffle", "time", "repeat", "previous", "art", "next"]))
+TEXT_ROLES = dict(PAGE2_ROLES, **{"page2:gridTopLeft": "song", "page2:gridTopMiddle": "artist",
+                                  "page2:gridTopRight": "album"})
+TEXT_SLOTS = ["page2:gridTopLeft", "page2:gridTopMiddle", "page2:gridTopRight"]
 
 
 class ModuleTest(unittest.TestCase):
@@ -786,6 +789,93 @@ class ModuleTest(unittest.TestCase):
         self.assertGreaterEqual(len(got), 2)
         self.assertEqual({m["slot"] for m in got}, {"page2:gridMiddle"})
 
+    # Song, artist, and album keys
+
+    def walkin(self, **extra):
+        self.playing(name="Walkin' On The Sun", artist="Smash Mouth", album="Fush Yu Mang",
+                     artwork=self.position_art(), **extra)
+
+    def text_preview(self, slot, *extra):
+        """The key at `slot` of TEXT_ROLES as --preview draws it."""
+        return self.preview("--role", TEXT_ROLES[slot], "--slot", slot[len("page2:"):], *extra)
+
+    def walkin_preview(self, slot, *extra):
+        return self.text_preview(slot, "--title", "Walkin' On The Sun", "--artist", "Smash Mouth",
+                                 "--album", "Fush Yu Mang", "--artwork", self.position_art(), *extra)
+
+    def test_song_artist_and_album_keys_each_draw_one_key_and_stay_still(self):
+        self.walkin(position=30, duration=200000)
+        host = self.start(settings={"keys": TEXT_ROLES, "banner_fps": 8})
+        host.keys(self.page("page2:"))
+        got = self.by_slot(self.keyed_images(9))
+        for slot in TEXT_SLOTS:
+            self.assertEqual(got[slot]["_bytes"], self.walkin_preview(slot), f"{slot} is not its own one-key face")
+            width, height, pixel = read_png(got[slot]["_bytes"])
+            white = sum(1 for y in range(height) for x in range(width) if min(pixel(x, y)[:3]) >= 235)
+            self.assertGreater(white, 150, f"no words on {slot}")
+        self.assertEqual(len({got[slot]["png"] for slot in TEXT_SLOTS}), 3)
+        # The time key ticks every second; the words are never sent again.
+        later = [m for m in host.drain(2.5) if m["type"] in ("image", "image_all")]
+        self.assertTrue(later, "the time key did not tick")
+        self.assertEqual({m["slot"] for m in later}, {"page2:gridMiddle"})
+
+    def test_song_artist_and_album_roles_are_accepted_without_a_warning(self):
+        self.walkin()
+        host = self.start(settings={"keys": TEXT_ROLES})
+        got = host.drain(0.8)
+        self.assertEqual([m for m in got if m["type"] == "log" and m["level"] == "warn"], [])
+
+    def test_a_page_with_text_keys_is_not_a_mosaic(self):
+        self.walkin()
+        host = self.start(settings={"keys": {slot: TEXT_ROLES[slot] for slot in TEXT_SLOTS}})
+        host.keys([self.slot()])
+        full = self.image()
+        host.keys(self.page("page2:"))
+        got = self.by_slot(self.keyed_images(9))
+        for slot, message in got.items():
+            if slot not in TEXT_SLOTS:
+                self.assertEqual(message["png"], full["png"], f"{slot} is not the full tile")
+        for slot in TEXT_SLOTS:
+            self.assertEqual(got[slot]["_bytes"], self.walkin_preview(slot))
+        self.assertEqual([m for m in host.drain(0.5) if m["type"] == "image_all"], [])
+
+    def test_the_album_is_read_only_while_an_album_key_is_bound(self):
+        self.walkin()
+        host = self.start(settings={"keys": TEXT_ROLES})
+        host.keys([self.slot(name=slot) for slot in TEXT_SLOTS[:2]])
+        self.keyed_images(2)
+        self.assertIn("read", self.calls())
+        self.assertNotIn("album", self.calls())
+        host.keys([self.slot(name=slot) for slot in TEXT_SLOTS])
+        album = [m for m in host.drain(1.0) if m["type"] == "image" and m["slot"] == TEXT_SLOTS[2]]
+        self.assertIn("album", self.calls())
+        self.assertTrue(album, "the album key was not drawn")
+        self.assertEqual(album[-1]["_bytes"], self.walkin_preview(TEXT_SLOTS[2]))
+
+    def test_text_keys_dim_when_paused_and_say_nothing_playing_when_not_running(self):
+        self.walkin(state="paused")
+        host = self.start(settings={"keys": TEXT_ROLES})
+        host.keys(self.page("page2:"))
+        got = self.by_slot(self.keyed_images(9))
+        for slot in TEXT_SLOTS:
+            self.assertEqual(got[slot]["_bytes"], self.walkin_preview(slot, "--paused"), f"{slot} paused")
+        self.set_state(running=False)
+        latest = self.by_slot(m for m in host.drain(1.5) if m["type"] == "image")
+        for slot in TEXT_SLOTS:
+            self.assertIn(slot, latest, f"{slot} was not redrawn when Spotify quit")
+            self.assertEqual(latest[slot]["_bytes"], self.text_preview(slot), f"{slot} with nothing loaded")
+        self.assertNotEqual(latest[TEXT_SLOTS[0]]["png"], latest[TEXT_SLOTS[1]]["png"], "no Nothing playing")
+
+    def test_a_press_on_a_text_key_plays_or_pauses(self):
+        self.walkin()
+        host = self.start(settings={"keys": TEXT_ROLES})
+        host.keys(self.page("page2:"))
+        self.keyed_images(9)
+        host.press(device="keypad-1", slot="page2:gridTopMiddle")
+        latest = self.by_slot(m for m in host.drain(1.0) if m["type"] == "image")
+        self.assertIn("playpause", self.calls())
+        self.assertEqual(latest["page2:gridTopMiddle"]["_bytes"], self.walkin_preview("page2:gridTopMiddle", "--paused"))
+
 
 class SelfTest(unittest.TestCase):
     def test_script_wrapper(self):
@@ -795,6 +885,19 @@ class SelfTest(unittest.TestCase):
         result = subprocess.run([BINARY, "--self-test"], capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn("FAIL", result.stdout)
+
+    def test_text_key_words_wrap_shrink_and_ellipsize(self):
+        if not BINARY:
+            self.skipTest("MODULE_TEST_BINARY is not set; run zsh tests/run.sh")
+        result = subprocess.run([BINARY, "--self-test"], capture_output=True, text=True, timeout=30)
+        for check in ("the album reads return the album name last",
+                      "text keys wrap to at most 3 lines",
+                      "text key lines fit inside the padding",
+                      "a long title gets a smaller size than a short one",
+                      "a title that fits is not ellipsized",
+                      "an over-long title is ellipsized at size 15",
+                      "an empty text key has no lines"):
+            self.assertIn("PASS " + check + "\n", result.stdout)
 
 
 if __name__ == "__main__":

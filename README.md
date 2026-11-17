@@ -128,20 +128,23 @@ controls take the album's colors) and an accent color picked from the cover.
 | --- | --- | --- |
 | `art` | The full tile, as on any other key. The default for every key. | Plays or pauses. |
 | `title` | The title over the artist. Side by side `title` keys in one row make one banner across them, with the same gap handling as a mosaic. | Plays or pauses. |
+| `song` | The title alone, in bold, on this one key. | Plays or pauses. |
+| `artist` | The artist alone, on this one key. | Plays or pauses. |
+| `album` | The album name alone, on this one key. | Plays or pauses. |
 | `shuffle` | Shuffle arrows; in the accent color with an underline when on. | Turns shuffle on or off. |
 | `repeat` | The repeat loop, on or off like shuffle. | Turns repeat on or off. |
 | `time` | The time into the track, with a ring that fills as it plays, updated every second. | Jumps back 15 seconds. |
 | `previous` | Skip back. | Previous track. |
 | `next` | Skip forward. | Next track. |
 
-For example, page 2 of a Spotify profile: a title banner over shuffle, time,
-and repeat, over previous, art, and next:
+For example, page 2 of a Spotify profile: the song, artist, and album over
+shuffle, time, and repeat, over previous, art, and next:
 
 ```toml
 [modules."com.typ.openlogi.spotify".settings.keys]
-"page2:gridTopLeft" = "title"
-"page2:gridTopMiddle" = "title"
-"page2:gridTopRight" = "title"
+"page2:gridTopLeft" = "song"
+"page2:gridTopMiddle" = "artist"
+"page2:gridTopRight" = "album"
 "page2:gridMiddleLeft" = "shuffle"
 "page2:gridMiddle" = "time"
 "page2:gridMiddleRight" = "repeat"
@@ -151,10 +154,21 @@ and repeat, over previous, art, and next:
 ```
 
 Bind those nine keys to Spotify Now Playing as well, as in the mosaic sample
-above. A title too long for its banner first shrinks, then scrolls: still for
-2 seconds, across, still for 2 seconds, and back. `banner_fps` (default `3`,
-0 to 8) sets how many frames a second it moves; `0` turns scrolling off and
-ends a long title in an ellipsis. Titles do not scroll while paused.
+above.
+
+The `song`, `artist`, and `album` keys each keep their words on their own
+key, so no word is ever cut by the edges between keys. The words are white,
+centered, and wrapped to at most three lines, at the largest size that fits
+without breaking a word; a name too long for three lines at the smallest
+size ends in an ellipsis. A shade over each key keeps the words readable on
+a light cover. These keys never scroll. The album name is read from Spotify
+only while an `album` key is bound.
+
+For the older banner, set the top row to `title` instead. A title too long
+for its banner first shrinks, then scrolls: still for 2 seconds, across,
+still for 2 seconds, and back. `banner_fps` (default `3`, 0 to 8) sets how
+many frames a second it moves; `0` turns scrolling off and ends a long title
+in an ellipsis. Titles do not scroll while paused.
 
 - **Repeat is on or off only.** Spotify's Mac scripting has no repeat-one
   setting, so the key cannot show or choose it.
@@ -164,8 +178,8 @@ ends a long title in an ellipsis. Titles do not scroll while paused.
   (page 2 here), so another profile's key on that slot is not turned into a
   control.
 - With Spotify not running or nothing loaded, the control keys go dim and
-  their presses do nothing; the title says Nothing playing and the art key
-  shows the app icon.
+  their presses do nothing; the title and the song key say Nothing playing,
+  the artist and album keys go blank, and the art key shows the app icon.
 - A role that is not one of these, or is not text, counts as `art` and puts
   one warning in OpenLogi's log.
 
@@ -240,6 +254,9 @@ Render one tile to a PNG without Spotify or OpenLogi:
 ./spotify-module --preview out.png                # its stand-in
 ./spotify-module --preview out.png --role time --position 102 --duration 236 \
     --artwork ~/Pictures/cover.jpg                # a control key (any role but art)
+./spotify-module --preview out.png --role album --slot gridTopRight \
+    --title "Midnight City" --artist "M83" --album "Hurry Up, We're Dreaming" \
+    --artwork ~/Pictures/cover.jpg                # an album key on the top row
 ```
 
 Try the module without OpenLogi: `tools/fake_host.py` starts it, sends

@@ -366,7 +366,7 @@ func renderBlackTile(size: Int) -> CGImage? {
 /// What a bound key shows and does. `art` is the full tile; the rest make up
 /// a control page (settings `keys`).
 enum Role: String {
-    case art, title, shuffle, `repeat`, time, previous, next
+    case art, title, shuffle, `repeat`, time, previous, next, song, artist, album
 
     /// The command a press sends; nil for the play/pause keys.
     var command: PlayerCommand? {
@@ -376,14 +376,18 @@ enum Role: String {
         case .time: return .seekBack
         case .previous: return .previous
         case .next: return .next
-        case .art, .title: return nil
+        case .art, .title, .song, .artist, .album: return nil
         }
     }
+
+    /// One key of words: the song, artist, or album name.
+    var isText: Bool { self == .song || self == .artist || self == .album }
 }
 
 let neutralAccent = CGColor(srgbRed: 0.82, green: 0.82, blue: 0.84, alpha: 1)
 let scrollSpeed: CGFloat = 30      // pixels a second on a 118 px key
 let scrollPause: Double = 2
+let textScrim: CGFloat = 0.35      // black over a song, artist, or album key
 
 func hsv(_ r: Double, _ g: Double, _ b: Double) -> (h: Double, s: Double, v: Double) {
     let high = max(r, g, b)
@@ -521,8 +525,50 @@ struct ControlState {
     var on = false               // shuffle or repeat
     var elapsed = 0              // seconds
     var duration = 0.0           // seconds
+    var text = ""                // song, artist, or album
 
-    var key: String { "\(role.rawValue) \(enabled) \(on) \(elapsed) \(Int(duration))" }
+    var key: String { "\(role.rawValue) \(enabled) \(on) \(elapsed) \(Int(duration))" + (text.isEmpty ? "" : "\n\(text)") }
+}
+
+/// The words on a song, artist, or album key; nil `track` is nothing loaded.
+func tileText(_ role: Role, _ track: Track?) -> String {
+    guard let track else { return role == .song ? "Nothing playing" : "" }
+    switch role {
+    case .song: return cleaned(track.title).isEmpty ? "Unknown track" : cleaned(track.title)
+    case .artist: return cleaned(track.artist)
+    case .album: return cleaned(track.album)
+    default: return ""
+    }
+}
+
+/// A line's width without its trailing spaces.
+func visibleWidth(_ line: CTLine) -> CGFloat {
+    CGFloat(CTLineGetTypographicBounds(line, nil, nil, nil)) - CGFloat(CTLineGetTrailingWhitespaceWidth(line))
+}
+
+/// `text` wrapped to at most 3 lines inside `box`, at the largest size from
+/// 28 down to 15 (per 118 px key) where it fits with no word broken; failing
+/// that, at 15 with the last line ending in an ellipsis. Only a word wider
+/// than the box at 15 is broken. `size` is per 118 px key.
+func fitText(_ text: String, weight: NSFont.Weight, color: CGColor, box: CGSize, k: CGFloat)
+    -> (lines: [CTLine], font: CTFont, size: CGFloat, truncated: Bool) {
+    let words = text.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+    var size: CGFloat = 28
+    while true {
+        let textFont = font(size: size * k, weight: weight)
+        let string = attributed(text, font: textFont, color: color)
+        let lines = layoutLines(string, width: box.width, maxLines: .max)
+        let height = CTFontGetAscent(textFont) + CTFontGetDescent(textFont)
+        let fits = lines.count <= 3 && height * (1 + 0.96 * CGFloat(max(0, lines.count - 1))) <= box.height
+            && words.allSatisfy {
+                visibleWidth(CTLineCreateWithAttributedString(attributed($0, font: textFont, color: color))) <= box.width
+            }
+        if fits { return (lines, textFont, size, false) }
+        if size <= 15 {
+            return (layoutLines(string, width: box.width, maxLines: 3), textFont, size, lines.count > 3)
+        }
+        size -= 1
+    }
 }
 
 func strokeIcon(_ path: CGPath, color: CGColor, width: CGFloat, context: CGContext) {
@@ -590,9 +636,9 @@ func drawSkipIcon(forward: Bool, center: CGPoint, k: CGFloat, color: CGColor, co
     context.restoreGState()
 }
 
-/// One control key: its icon (or the time and its ring) over its part of the
-/// page background. White; shuffle and repeat in the accent when on and
-/// faint when off; everything dimmed with nothing loaded.
+/// One control key: its icon (or the time and its ring, or its words) over
+/// its part of the page background. White; shuffle and repeat in the accent
+/// when on and faint when off; everything dimmed with nothing loaded.
 func renderControl(_ state: ControlState, background: CGImage, accent: CGColor, size: Int) -> CGImage? {
     guard let context = CGContext(
         data: nil, width: size, height: size, bitsPerComponent: 8, bytesPerRow: 0,
@@ -648,6 +694,23 @@ func renderControl(_ state: ControlState, background: CGImage, accent: CGColor, 
         let bounds = CTLineGetBoundsWithOptions(line, .useGlyphPathBounds)
         context.textPosition = CGPoint(x: center.x - bounds.midX, y: center.y - bounds.midY)
         CTLineDraw(line, context)
+    case .song, .artist, .album:
+        // A scrim over the whole key keeps white words readable on a light cover.
+        context.setFillColor(black(textScrim))
+        context.fill(CGRect(x: 0, y: 0, width: s, height: s))
+        let weight: NSFont.Weight = state.role == .song ? .bold : state.role == .artist ? .semibold : .medium
+        let pad = 10 * k
+        let fit = fitText(state.text, weight: weight, color: color, box: CGSize(width: s - 2 * pad, height: s - 2 * pad), k: k)
+        let ascent = CTFontGetAscent(fit.font)
+        let step = (ascent + CTFontGetDescent(fit.font)) * 0.96
+        let height = ascent + CTFontGetDescent(fit.font) + step * CGFloat(max(0, fit.lines.count - 1))
+        var baseline = (s + height) / 2 - ascent
+        context.setShadow(offset: CGSize(width: 0, height: -0.75 * k), blur: 2.5 * k, color: black(0.7))
+        for line in fit.lines {
+            context.textPosition = CGPoint(x: (s - visibleWidth(line)) / 2, y: baseline)
+            CTLineDraw(line, context)
+            baseline -= step
+        }
     case .art, .title:
         break
     }
@@ -878,6 +941,7 @@ struct Track {
     var repeating = false
     var position: Double = 0     // seconds
     var duration: Double = 0     // seconds
+    var album = ""               // read only while an album key is bound
 }
 
 enum SpotifyState {
@@ -910,8 +974,9 @@ protocol SpotifyBackend: AnyObject {
     var notification: Notification.Name { get }
     func isInstalled() -> Bool
     func isRunning() -> Bool
-    /// `extended` also reads shuffle, repeat, position, and duration.
-    func read(extended: Bool) -> SpotifyState
+    /// `extended` also reads shuffle, repeat, position, and duration; `album`
+    /// the album name.
+    func read(extended: Bool, album: Bool) -> SpotifyState
     func playPause() -> CommandOutcome
     func command(_ command: PlayerCommand) -> CommandOutcome
     func launch() -> CommandOutcome
@@ -971,6 +1036,24 @@ set shuffleState to false
         end try
         return {stateText, trackID, trackName, trackArtist, artworkURL, shuffleState, repeatState, positionSeconds, durationValue}
 """)
+
+/// `source` (either read above) with the album name read too, returned last.
+func withAlbum(_ source: String) -> String {
+    let start = source.range(of: "return {stateText")!
+    let end = source.range(of: "}", range: start.upperBound..<source.endIndex)!
+    let albumLines = """
+    set trackAlbum to ""
+            try
+                set trackAlbum to (album of current track) as text
+            end try
+
+    """
+    return String(source[..<start.lowerBound]) + albumLines + "        " + String(source[start.lowerBound..<end.lowerBound])
+        + ", trackAlbum}" + String(source[end.upperBound...])
+}
+
+let readAlbumSource = withAlbum(readSource)
+let readExtendedAlbumSource = withAlbum(readExtendedSource)
 
 func commandSource(_ command: PlayerCommand) -> String {
     let body: String
@@ -1032,6 +1115,8 @@ final class SpotifyReader: SpotifyBackend {
     let notification = spotifyNotification
     private let reader = Script(readSource)
     private let extendedReader = Script(readExtendedSource)
+    private let albumReader = Script(readAlbumSource)
+    private let extendedAlbumReader = Script(readExtendedAlbumSource)
     private var commandScripts: [String: Script] = [:]
     private let playPauseScript = Script(playPauseSource)
     private let launchScript = Script(launchSource)
@@ -1046,9 +1131,10 @@ final class SpotifyReader: SpotifyBackend {
             .contains { !$0.isTerminated }
     }
 
-    func read(extended: Bool) -> SpotifyState {
+    func read(extended: Bool, album: Bool) -> SpotifyState {
         guard isRunning() else { return .notRunning }
-        switch (extended ? extendedReader : reader).run() {
+        let script = album ? (extended ? extendedAlbumReader : albumReader) : (extended ? extendedReader : reader)
+        switch script.run() {
         case .failure(let error):
             // -600 and -609: Spotify quit between the running check and the
             // read (it posts one last playback notification as it quits).
@@ -1069,6 +1155,10 @@ final class SpotifyReader: SpotifyBackend {
                 // would put the position past the end.
                 let duration = result.atIndex(9)?.doubleValue ?? 0
                 track.duration = duration / 1000 >= track.position ? duration / 1000 : duration
+            }
+            let albumIndex = extended ? 10 : 6
+            if album, result.numberOfItems >= albumIndex {
+                track.album = item(albumIndex)
             }
             return .track(track)
         }
@@ -1309,7 +1399,7 @@ struct Banner: Hashable {
     var slots: [String] { (first..<first + count).map { page + gridSlots[$0] } }
 }
 
-/// A shuffle, repeat, time, previous, or next key.
+/// A shuffle, repeat, time, previous, next, song, artist, or album key.
 struct Control: Hashable {
     var device: String
     var slot: String
@@ -1462,6 +1552,7 @@ final class Controller {
     /// Keys drawn one by one rather than with one image_all.
     var perKey: Bool { !mosaics.isEmpty || hasRoles }
     var needsExtendedRead: Bool { controls.contains { $0.role == .shuffle || $0.role == .repeat || $0.role == .time } }
+    var needsAlbumRead: Bool { controls.contains { $0.role == .album } }
 
     var shown = Shown.unknown
     var shownDisplay: Display?
@@ -1804,7 +1895,7 @@ final class Controller {
     /// Reads Spotify once and brings the keys in line.
     func perform(reconcile: Bool, now: Date = Date()) {
         guard active, now >= nextAttemptAt else { return }
-        switch backend.read(extended: needsExtendedRead) {
+        switch backend.read(extended: needsExtendedRead, album: needsAlbumRead) {
         case .failed(let message):
             // The same AppleScript error on every reconcile would flood the log.
             if message != lastReadError || now.timeIntervalSince(lastReadErrorAt) >= artRetryInterval {
@@ -2071,7 +2162,10 @@ final class Controller {
 
     func controlState(_ role: Role, _ display: Display) -> ControlState {
         var state = ControlState(role: role)
-        guard case .track(let track) = display else { return state }
+        var track: Track?
+        if case .track(let loaded) = display { track = loaded }
+        if role.isText { state.text = tileText(role, track) }
+        guard let track else { return state }
         state.enabled = true
         state.on = role == .shuffle ? track.shuffling : role == .repeat ? track.repeating : false
         if role == .time {
@@ -2246,6 +2340,7 @@ struct PreviewConfig {
     var output: String?
     var title: String?
     var artist: String?
+    var album: String?
     var artwork: String?
     var paused = false
     var appIcon = false
@@ -2261,7 +2356,7 @@ let usage = """
 usage: spotify-module
        spotify-module --preview OUT.png [--title T --artist A
                       [--artwork FILE_OR_URL] [--paused] | --app-icon] [--size PIXELS]
-                      [--role ROLE [--slot SLOT] [--on] [--position S] [--duration S]]
+                      [--role ROLE [--slot SLOT] [--album A] [--on] [--position S] [--duration S]]
 
   With no arguments it runs as an OpenLogi key module, speaking the module
   protocol on stdin and stdout; OpenLogi starts it that way.
@@ -2270,9 +2365,10 @@ usage: spotify-module
              nor OpenLogi. With --app-icon it renders the Spotify-not-running
              tile; without --title or --app-icon, the generic stand-in.
   --role     render a control key instead (shuffle, repeat, time, previous,
-             next) as it looks at grid SLOT (default gridMiddle) of a control
-             page, or with title the banner across the top row. Without
-             --title or --artwork it is drawn as with nothing loaded.
+             next, song, artist, album) as it looks at grid SLOT (default
+             gridMiddle) of a control page, or with title the banner across
+             the top row. Without --title or --artwork it is drawn as with
+             nothing loaded.
 """
 
 func runPreview(_ args: [String]) -> Never {
@@ -2289,6 +2385,7 @@ func runPreview(_ args: [String]) -> Never {
         case "--preview": config.output = value(flag)
         case "--title": config.title = value(flag)
         case "--artist": config.artist = value(flag)
+        case "--album": config.album = value(flag)
         case "--artwork": config.artwork = value(flag)
         case "--paused": config.paused = true
         case "--app-icon": config.appIcon = true
@@ -2341,6 +2438,10 @@ func runPreview(_ args: [String]) -> Never {
             state.on = config.on
             state.elapsed = Int(config.position)
             state.duration = config.duration
+            if role.isText {
+                state.text = tileText(role, loaded ? Track(id: "", title: config.title ?? "", artist: config.artist ?? "",
+                                                           artworkURL: "", playing: !config.paused, album: config.album ?? "") : nil)
+            }
             image = renderControl(state, background: background, accent: palette.accent, size: config.size)
         }
     } else if let title = config.title {

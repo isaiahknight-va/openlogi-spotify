@@ -6,12 +6,16 @@
 //   {"installed": true, "running": true, "state": "playing" | "paused" | "stopped",
 //    "id": "...", "name": "...", "artist": "...", "artwork": "/path/or/url",
 //    "plays_needed": 3, "read_error": "message",
-//    "shuffling": false, "repeating": false, "position": 12.5, "duration": 200000}
+//    "shuffling": false, "repeating": false, "position": 12.5, "duration": 200000,
+//    "album": "..."}
 // `position` is in seconds and advances with the clock from the file's last
 // write while playing; `duration` is in milliseconds, as Spotify reports it.
-// Every call is appended to $FAKE_SPOTIFY_DIR/calls.log, one word per line.
+// Every call is appended to $FAKE_SPOTIFY_DIR/calls.log, one word per line;
+// a read that asks for the album name adds `album` after its `read`.
 // A change to state.json stands in for Spotify's playback notification.
 
+import AppKit
+import CoreText
 import Foundation
 
 final class FakeSpotify: SpotifyBackend {
@@ -86,8 +90,9 @@ final class FakeSpotify: SpotifyBackend {
         return stored + max(0, Date().timeIntervalSince(written))
     }
 
-    func read(extended: Bool) -> SpotifyState {
+    func read(extended: Bool, album: Bool) -> SpotifyState {
         record("read")
+        if album { record("album") }
         let state = load()
         guard state["running"] as? Bool ?? false else { return .notRunning }
         if let message = state["read_error"] as? String { return .failed(message) }
@@ -102,6 +107,7 @@ final class FakeSpotify: SpotifyBackend {
             track.position = position(state)
             track.duration = ((state["duration"] as? NSNumber)?.doubleValue ?? 0) / 1000
         }
+        if album { track.album = state["album"] as? String ?? "" }
         return .track(track)
     }
 
@@ -184,5 +190,39 @@ func runSelfTest() -> Never {
 
     let permission = ScriptError(number: -1743, message: "x")
     check("-1743 explains the Automation setting", permission.description.contains("Automation"))
+
+    check("the album reads return the album name last",
+          readAlbumSource.contains("album of current track") && readAlbumSource.contains("artworkURL, trackAlbum}")
+          && readExtendedAlbumSource.contains("durationValue, trackAlbum}")
+          && !readSource.contains("album of") && !readExtendedSource.contains("album of"))
+
+    // The song, artist, and album keys' text at 118 px: 98 px inside the padding.
+    let box = CGSize(width: 98, height: 98)
+    func fit(_ text: String, _ weight: NSFont.Weight = .bold) -> (lines: [CTLine], font: CTFont, size: CGFloat, truncated: Bool) {
+        fitText(text, weight: weight, color: white(1), box: box, k: 1)
+    }
+    let short = fit("Take a Walk")
+    let long = fit("Golden Hour Drive Home")
+    let stress = fit("Supercalifragilisticexpialidocious (From Mary Poppins Original Soundtrack)")
+    let album = fit("Mary Poppins (Original Motion Picture Soundtrack / Deluxe Edition)", .medium)
+    let all = [short, long, stress, album, fit("Walkin' On The Sun"), fit("Judah & the Lion", .semibold), fit("Gossamer", .medium)]
+    check("text keys wrap to at most 3 lines", all.allSatisfy { !$0.lines.isEmpty && $0.lines.count <= 3 })
+    check("text key lines fit inside the padding", all.allSatisfy { $0.lines.allSatisfy { visibleWidth($0) <= box.width } })
+    check("a long title gets a smaller size than a short one", long.size < short.size && short.size <= 28 && long.size >= 15)
+    check("a title that fits is not ellipsized", !short.truncated && !long.truncated)
+    func endsInEllipsis(_ result: (lines: [CTLine], font: CTFont, size: CGFloat, truncated: Bool)) -> Bool {
+        var ellipsis = CGGlyph(0)
+        var character: UniChar = 0x2026
+        guard let last = result.lines.last, CTFontGetGlyphsForCharacters(result.font, &character, &ellipsis, 1),
+              let run = (CTLineGetGlyphRuns(last) as? [CTRun])?.last, CTRunGetGlyphCount(run) > 0 else { return false }
+        var glyph = CGGlyph(0)
+        CTRunGetGlyphs(run, CFRange(location: CTRunGetGlyphCount(run) - 1, length: 1), &glyph)
+        return glyph == ellipsis
+    }
+    check("an over-long title is ellipsized at size 15",
+          stress.truncated && album.truncated && stress.size == 15 && album.size == 15
+          && stress.lines.count == 3 && album.lines.count == 3 && endsInEllipsis(stress) && endsInEllipsis(album)
+          && !endsInEllipsis(short) && !endsInEllipsis(long))
+    check("an empty text key has no lines", fit("").lines.isEmpty)
     exit(failures == 0 ? 0 : 1)
 }
