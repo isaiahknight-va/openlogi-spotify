@@ -677,13 +677,16 @@ func scrollOffset(elapsed: Double, distance: CGFloat, speed: CGFloat) -> CGFloat
     return distance
 }
 
-/// A title banner across one to three keys of a row: the title over the
-/// artist, left aligned, on the banner's part of the page background (as
-/// wide as the banner, gaps included). With `offset` the title is drawn that
-/// far left, clipped to the banner, to scroll; without it a title too long
-/// at the smallest size ends in an ellipsis. The artist truncates.
-func renderBanner(title: String, artist: String, background: CGImage, size: Int, offset: CGFloat?) -> CGImage? {
-    let width = background.width
+/// A title banner across `count` keys of a row: the title over the artist,
+/// left aligned. The canvas is the keys side by side with no gaps (cut it at
+/// multiples of `size`), so no letter is lost under a gap; the background is
+/// the banner's part of the page background, gaps included, each key's own
+/// piece put in place. With `offset` the title is drawn that far left,
+/// clipped to the banner, to scroll; without it a title too long at the
+/// smallest size ends in an ellipsis. The artist truncates.
+func renderBanner(title: String, artist: String, background: CGImage, size: Int, count: Int, gap: Int,
+                  offset: CGFloat?) -> CGImage? {
+    let width = count * size
     guard let context = CGContext(
         data: nil, width: width, height: size, bitsPerComponent: 8, bytesPerRow: 0,
         space: sRGB, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
@@ -691,7 +694,10 @@ func renderBanner(title: String, artist: String, background: CGImage, size: Int,
     let s = CGFloat(size)
     let k = s / 118
     let w = CGFloat(width)
-    context.draw(background, in: CGRect(x: 0, y: 0, width: w, height: s))
+    for i in 0..<count {
+        guard let piece = background.cropping(to: CGRect(x: i * (size + gap), y: 0, width: size, height: size)) else { return nil }
+        context.draw(piece, in: CGRect(x: CGFloat(i * size), y: 0, width: s, height: s))
+    }
     let pad = 12 * k
     let available = w - 2 * pad
     let fit = fitTitle(title, width: available, k: k)
@@ -2131,7 +2137,7 @@ final class Controller {
             }
             let gap = mosaicGap(size: banner.size)
             let k = CGFloat(banner.size) / 118
-            let available = CGFloat(banner.count * banner.size + (banner.count - 1) * gap) - 24 * k
+            let available = CGFloat(banner.count * banner.size) - 24 * k
             let distance = fitTitle(title, width: available, k: k).width - available
             var offset: CGFloat?
             if distance > 0 && playing && settings.bannerFps > 0 {
@@ -2151,13 +2157,14 @@ final class Controller {
                 continue
             }
             guard let background = pageCrop(palette.canvas, index: banner.first, count: banner.count, size: banner.size, gap: gap),
-                  let canvas = renderBanner(title: title, artist: artist, background: background, size: banner.size, offset: offset)
+                  let canvas = renderBanner(title: title, artist: artist, background: background, size: banner.size,
+                                            count: banner.count, gap: gap, offset: offset)
             else {
                 failed("rendering the title banner", now: now)
                 return
             }
             for (i, slot) in banner.slots.enumerated() {
-                let rect = CGRect(x: i * (banner.size + gap), y: 0, width: banner.size, height: banner.size)
+                let rect = CGRect(x: i * banner.size, y: 0, width: banner.size, height: banner.size)
                 guard let tile = canvas.cropping(to: rect), let png = pngData(tile) else {
                     failed("rendering the title banner", now: now)
                     return
@@ -2326,7 +2333,8 @@ func runPreview(_ args: [String]) -> Never {
         else { die("could not render the control background") }
         if role == .title {
             image = renderBanner(title: loaded ? config.title ?? "Unknown track" : "Nothing playing",
-                                 artist: config.artist ?? "", background: background, size: config.size, offset: nil)
+                                 artist: config.artist ?? "", background: background, size: config.size,
+                                 count: 3, gap: gap, offset: nil)
         } else {
             var state = ControlState(role: role)
             state.enabled = loaded

@@ -641,9 +641,34 @@ class ModuleTest(unittest.TestCase):
             white = sum(1 for y in range(20, 70) for x in range(width) if min(pixel(x, y)[:3]) >= 235)
             self.assertGreater(white, 20, f"no title on {name}")
 
+    def test_banner_text_is_never_lost_under_the_gaps(self):
+        self.playing(name="Golden Hour Drive", artist="The Night Lanterns", artwork=self.position_art())
+        keys = {"page2:" + name: "title" for name in GRID[:3]}
+
+        def banner(gap_percent):
+            host = self.start(settings={"keys": keys, "mosaic_gap_percent": gap_percent})
+            host.keys(self.page("page2:"))
+            tiles = {m["slot"][6:]: m for m in self.keyed_images(9)}
+            self.assertEqual(host.shutdown(), 0)
+            self.assertEqual(host.problems, [])
+            decoded = [read_png(tiles[name]["_bytes"]) for name in GRID[:3]]
+            # The three keys side by side, with no gaps.
+            return [[decoded[x // 118][2](x % 118, y)[:3] for x in range(3 * 118)] for y in range(118)]
+
+        def ink(rows):
+            return sum(1 for row in rows for pixel in row if min(pixel) >= 200)
+
+        with_gaps = banner(25)
+        _, _, pixel = read_png(self.preview("--role", "title", "--title", "Golden Hour Drive",
+                                            "--artist", "The Night Lanterns", "--artwork", self.position_art()))
+        whole = [[pixel(x, y)[:3] for x in range(3 * 118)] for y in range(118)]
+        self.assertEqual(with_gaps, whole, "the keys are not one uncut banner")
+        self.assertGreater(ink(with_gaps), 500)
+        self.assertAlmostEqual(ink(with_gaps), ink(banner(0)), delta=ink(with_gaps) * 0.03)
+
     def scroll_title(self):
-        # 443 px at the smallest size, 53 more than the banner holds.
-        return "Golden Hour Drive Through The Long Night Again"
+        # 387 px at the smallest size, 57 more than the banner holds.
+        return "Golden Hour Drive Through The Long Night"
 
     def test_a_long_title_scrolls_and_rests_at_both_ends(self):
         self.playing(name=self.scroll_title(), artwork=self.position_art())
